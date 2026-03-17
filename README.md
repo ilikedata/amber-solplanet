@@ -1,8 +1,14 @@
-# Electricity Controller
+# Amber Electric Solplanet Inverter/Battery Controller
+
+## Introduction
 
 This repository contains a small local controller for **Solplanet battery/inverter systems** on **Amber Electric** pricing.
 
 It exists for a specific use case: you want battery behavior to respond to Amber price signals, but you do not want to depend on Home Assistant or a larger automation stack to do it.
+
+## Links
+
+- Heavily inspired by [Home Assistant Integration](https://github.com/calvinbui/home-assistant-solplanet) - I was having trouble with HACS so wrote my own.
 
 ## Problem
 
