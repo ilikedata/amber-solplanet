@@ -42,6 +42,7 @@ It uses:
 - **Amber general pricing** to decide when charging is allowed
 - **Amber feed-in pricing** to decide when discharge/export is attractive
 - **battery SOC guards** to stop charge/discharge outside configured bounds
+- **high-SOC price guards** so charging above 70% SOC only happens when import pricing is below 5 c/kWh by default
 - **demand-window guards** so charge windows do not run into the daily demand period
 - **short, backdated schedule windows** so stale commands naturally expire quickly if comms fail
 
@@ -67,6 +68,13 @@ The controller reads local configuration from `.env`:
 - `AMBER_API_KEY`
 
 See [`.env.example`](/home/tai/svn/electricity/.env.example).
+
+Useful CLI tuning knobs:
+
+- `--charge-target-soc` default `97`
+- `--discharge-target-soc` default `40`
+- `--high-soc-charge-threshold` default `70`
+- `--high-soc-cheap-price` default `5.0`
 
 ## Logging
 

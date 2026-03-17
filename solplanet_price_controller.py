@@ -39,6 +39,8 @@ DEFAULT_CHARGE_WATTS = 15000
 DEFAULT_DISCHARGE_WATTS = 1500
 DEFAULT_CHARGE_TARGET_SOC = 97
 DEFAULT_DISCHARGE_TARGET_SOC = 40
+DEFAULT_HIGH_SOC_CHARGE_THRESHOLD = 70
+DEFAULT_HIGH_SOC_CHEAP_PRICE = 5.0
 DEFAULT_PRICE_SOURCE = "manual"
 DEFAULT_AMBER_SITE_ID = ""
 DEFAULT_AMBER_API_KEY = ""
@@ -417,10 +419,19 @@ def decide_from_amber_prices(
 def apply_soc_gates(
     action: str,
     soc: int,
+    general_per_kwh: float | None,
     charge_target_soc: int,
     discharge_target_soc: int,
+    high_soc_charge_threshold: int,
+    high_soc_cheap_price: float,
 ) -> str:
     if action == "charge" and soc >= charge_target_soc:
+        return "fallback"
+    if (
+        action == "charge"
+        and soc >= high_soc_charge_threshold
+        and (general_per_kwh is None or general_per_kwh >= high_soc_cheap_price)
+    ):
         return "fallback"
     if action == "discharge" and soc <= discharge_target_soc:
         return "fallback"
@@ -529,8 +540,11 @@ def run_once(args: argparse.Namespace) -> None:
             gated_action = apply_soc_gates(
                 action=action,
                 soc=soc,
+                general_per_kwh=amber_decision.general.per_kwh,
                 charge_target_soc=args.charge_target_soc,
                 discharge_target_soc=args.discharge_target_soc,
+                high_soc_charge_threshold=args.high_soc_charge_threshold,
+                high_soc_cheap_price=args.high_soc_cheap_price,
             )
             final_action = apply_charge_window_guard(gated_action)
             log_json(
@@ -563,7 +577,7 @@ def run_once(args: argparse.Namespace) -> None:
         manual_general = AmberPriceSnapshot(
             site_id="manual",
             nem_time="manual",
-            per_kwh=0.0,
+            per_kwh=args.general_per_kwh,
             descriptor=args.general_descriptor,
             interval_type="manual",
             channel_type="general",
@@ -585,8 +599,11 @@ def run_once(args: argparse.Namespace) -> None:
         action = apply_soc_gates(
             action=manual_decision.action,
             soc=soc,
+            general_per_kwh=manual_general.per_kwh,
             charge_target_soc=args.charge_target_soc,
             discharge_target_soc=args.discharge_target_soc,
+            high_soc_charge_threshold=args.high_soc_charge_threshold,
+            high_soc_cheap_price=args.high_soc_cheap_price,
         )
         action = apply_charge_window_guard(action)
         log_json(
@@ -594,6 +611,7 @@ def run_once(args: argparse.Namespace) -> None:
             {
                 "source": "manual",
                 "general": args.general_descriptor,
+                "general_per_kwh": args.general_per_kwh,
                 "feed_in": args.feed_in_descriptor,
                 "general_demand_window": False,
                 "battery_soc": soc,
@@ -634,6 +652,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Hardcoded Amber feed-in descriptor for testing when --price-source=manual.",
     )
     parser.add_argument(
+        "--general-per-kwh",
+        type=float,
+        default=0.0,
+        help="Hardcoded Amber general import price in c/kWh for testing when --price-source=manual.",
+    )
+    parser.add_argument(
         "--host",
         default=env_or_default("SOLPLANET_HOST", DEFAULT_HOST),
         help="Solplanet inverter host.",
@@ -666,6 +690,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=DEFAULT_DISCHARGE_TARGET_SOC,
         help="Stop discharging and fall back once battery SOC falls to this percentage.",
+    )
+    parser.add_argument(
+        "--high-soc-charge-threshold",
+        type=int,
+        default=DEFAULT_HIGH_SOC_CHARGE_THRESHOLD,
+        help="Require a cheaper import price before charging once battery SOC reaches this percentage.",
+    )
+    parser.add_argument(
+        "--high-soc-cheap-price",
+        type=float,
+        default=DEFAULT_HIGH_SOC_CHEAP_PRICE,
+        help="Maximum import price in c/kWh allowed for charging at or above the high-SOC threshold.",
     )
     parser.add_argument(
         "--amber-site-id",
