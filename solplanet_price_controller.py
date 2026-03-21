@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""Drive Solplanet battery mode from a coarse electricity price state.
-
-This script implements a minimal state machine for local control:
-- `high` falls back to self-consumption mode.
-- `low` enables a 30-minute discharge override in custom mode.
-- `extremely_low` enables a 30-minute charge override in custom mode.
-
-Assumptions:
-- A short 30-minute slot is safer than long-lived schedules because stale
-  overrides expire quickly if automation breaks.
-- `Pin` and `Pout` are the effective schedule power setpoints in watts.
-- The safe fallback is self-consumption mode with an empty schedule.
-"""
+"""Amber forecast-driven Solplanet battery charger."""
 
 from __future__ import annotations
 
@@ -22,7 +10,7 @@ import ssl
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -36,11 +24,9 @@ DEFAULT_ENV_FILE = SCRIPT_DIR / ".env"
 DEFAULT_HOST = "192.168.68.119"
 DEFAULT_BATTERY_SN = ""
 DEFAULT_CHARGE_WATTS = 15000
+DEFAULT_PLANNER_CHARGE_KWH_PER_MINUTE = 10.158 / 60.0
 DEFAULT_DISCHARGE_WATTS = 1500
 DEFAULT_CHARGE_TARGET_SOC = 97
-DEFAULT_DISCHARGE_TARGET_SOC = 40
-DEFAULT_HIGH_SOC_CHARGE_THRESHOLD = 70
-DEFAULT_HIGH_SOC_CHEAP_PRICE = 5.0
 DEFAULT_PRICE_SOURCE = "manual"
 DEFAULT_AMBER_SITE_ID = ""
 DEFAULT_AMBER_API_KEY = ""
@@ -48,23 +34,17 @@ DEFAULT_LOOP_SECONDS = 300
 DEFAULT_REQUEST_RETRIES = 2
 DEFAULT_RETRY_DELAY_SECONDS = 2.0
 DEFAULT_LOG_FILE = "solplanet_price_controller.ndjson"
-DEFAULT_MIN_DISCHARGE_FEED_IN_PRICE = -30.0
+DEFAULT_PLANNER_HORIZON_HOURS = 24
+DEFAULT_PLANNER_INTERVAL_MINUTES = 5
+DEFAULT_BATTERY_CAPACITY_KWH = 50.0
 DEMAND_WINDOW_START_HOUR = 15
+DEMAND_WINDOW_END_HOUR = 21
 BATTERY_DEVICE = 4
 ACTION_SET_BATTERY = "setbattery"
 ACTION_SET_DEFINE = "setdefine"
 SELF_CONSUMPTION_MODE = 2
 CUSTOM_MODE = 4
 DAYS = ["Mon", "Tus", "Wen", "Thu", "Fri", "Sat", "Sun"]
-AMBER_DESCRIPTORS = [
-    "negative",
-    "extremelyLow",
-    "veryLow",
-    "low",
-    "neutral",
-    "high",
-    "spike",
-]
 
 
 @dataclass(frozen=True)
@@ -76,7 +56,6 @@ class Slot:
     mode: str
 
     def to_raw(self) -> int:
-        """Encode a schedule slot in the inverter's native format."""
         base = 0x3C02
         hour = 0x1000000
         half = 0x1E0000
@@ -91,6 +70,55 @@ class Slot:
         )
 
 
+@dataclass(frozen=True)
+class AmberPriceSnapshot:
+    site_id: str
+    start_time: datetime
+    end_time: datetime
+    duration_minutes: int
+    general_per_kwh: float
+    general_descriptor: str
+    feed_in_per_kwh: float | None
+    feed_in_descriptor: str | None
+    demand_window: bool
+
+
+@dataclass(frozen=True)
+class BatterySnapshot:
+    soc: int
+    battery_power_watts: int
+    battery_voltage_raw: int
+    battery_current_raw: int
+
+
+@dataclass(frozen=True)
+class ControlPlanStep:
+    interval_start: datetime
+    interval_end: datetime
+    duration_minutes: int
+    action: str
+    planned_charge_kwh: float
+    planned_charge_minutes: float
+    expected_grid_kw: float
+    expected_cost: float
+    projected_soc: int
+
+
+@dataclass(frozen=True)
+class ControlPlan:
+    action: str
+    steps: list[ControlPlanStep]
+    required_energy_kwh: float
+    required_charge_minutes: float
+    planned_charge_kwh: float
+    planned_charge_minutes: float
+    estimated_total_charge_cost: float
+    average_planned_charge_price_c_per_kwh: float
+    selected_interval_count: int
+    target_reachable: bool
+    planner_summary: str
+
+
 class InverterUnavailableError(RuntimeError):
     """Raised when the inverter cannot be reached safely."""
 
@@ -99,22 +127,22 @@ class InverterWriteError(RuntimeError):
     """Raised when a write to the inverter fails."""
 
 
+class PlannerUnavailableError(RuntimeError):
+    """Raised when planning inputs are unavailable."""
+
+
 LOG_FILE_PATH: Path | None = None
 
 
 def load_dotenv(dotenv_path: Path = DEFAULT_ENV_FILE) -> None:
-    """Load a simple KEY=VALUE .env file into the process environment."""
     if not dotenv_path.exists():
         return
-
     for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip("\"'")
-        os.environ.setdefault(key, value)
+        os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
 def env_or_default(name: str, default: str) -> str:
@@ -125,26 +153,107 @@ def env_or_default(name: str, default: str) -> str:
 
 
 def configure_logging(log_file: str) -> None:
-    """Configure append-only NDJSON logging."""
     global LOG_FILE_PATH
-    log_path = Path(log_file).expanduser()
-    if not log_path.is_absolute():
-        log_path = Path.cwd() / log_path
-    LOG_FILE_PATH = log_path
+    path = Path(log_file).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    LOG_FILE_PATH = path
 
 
 def log_json(label: str, payload: dict[str, Any]) -> None:
-    """Write one NDJSON record and mirror it to stdout."""
-    record = {
-        "ts": datetime.now().astimezone().isoformat(),
-        "event": label,
-        **payload,
-    }
+    record = {"ts": datetime.now().astimezone().isoformat(), "event": label, **payload}
     line = json.dumps(record, sort_keys=True)
     if LOG_FILE_PATH is not None:
         with LOG_FILE_PATH.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
     print(line)
+
+
+def cents_per_kwh_to_dollars(cents: float) -> float:
+    return cents / 100.0
+
+
+def current_slot(now: datetime | None = None) -> Slot:
+    now = now or datetime.now().astimezone()
+    if now.hour == 0 and now.minute < 30:
+        return Slot(day=DAYS[now.weekday()], start_hour=0, start_minute=0, duration_hours=1, mode="charge")
+    if now.minute < 30:
+        return Slot(
+            day=DAYS[now.weekday()],
+            start_hour=now.hour - 1,
+            start_minute=30,
+            duration_hours=1,
+            mode="charge",
+        )
+    return Slot(
+        day=DAYS[now.weekday()],
+        start_hour=now.hour,
+        start_minute=0,
+        duration_hours=1,
+        mode="charge",
+    )
+
+
+def charge_slot_allowed(now: datetime | None = None) -> bool:
+    now = now or datetime.now().astimezone()
+    slot = current_slot(now)
+    slot_start_minutes = (slot.start_hour * 60) + slot.start_minute
+    slot_end_minutes = slot_start_minutes + (slot.duration_hours * 60)
+    demand_start_minutes = DEMAND_WINDOW_START_HOUR * 60
+    demand_end_minutes = DEMAND_WINDOW_END_HOUR * 60
+    overlaps_demand = slot_start_minutes < demand_end_minutes and slot_end_minutes > demand_start_minutes
+    return not overlaps_demand
+
+
+def empty_schedule(pin: int = 0, pout: int = 0) -> dict[str, Any]:
+    schedule: dict[str, Any] = {"Pin": pin, "Pout": pout}
+    for day in DAYS:
+        schedule[day] = [0, 0, 0, 0, 0, 0]
+    return schedule
+
+
+def active_schedule(mode: str, watts: int, now: datetime | None = None) -> dict[str, Any]:
+    slot = current_slot(now)
+    schedule = empty_schedule(pin=watts if mode == "charge" else 0, pout=watts if mode == "discharge" else 0)
+    schedule[slot.day][0] = Slot(
+        day=slot.day,
+        start_hour=slot.start_hour,
+        start_minute=slot.start_minute,
+        duration_hours=slot.duration_hours,
+        mode=mode,
+    ).to_raw()
+    return schedule
+
+
+def build_setbattery_payload(battery_info: dict[str, Any], battery_sn: str, mode_register: int) -> dict[str, Any]:
+    return {
+        "value": {
+            "type": battery_info["type"],
+            "mod_r": mode_register,
+            "sn": battery_sn,
+            "discharge_max": battery_info["discharge_max"],
+            "charge_max": battery_info["charge_max"],
+            "muf": battery_info["muf"],
+            "mod": battery_info["mod"],
+            "num": battery_info["num"],
+        },
+        "device": BATTERY_DEVICE,
+        "action": ACTION_SET_BATTERY,
+    }
+
+
+def build_setdefine_payload(schedule: dict[str, Any]) -> dict[str, Any]:
+    return {"value": schedule, "device": BATTERY_DEVICE, "action": ACTION_SET_DEFINE}
+
+
+def desired_state(action: str, charge_watts: int, discharge_watts: int) -> tuple[int, dict[str, Any], str]:
+    if action == "fallback":
+        return SELF_CONSUMPTION_MODE, empty_schedule(), "fallback to self-consumption"
+    if action == "charge":
+        return CUSTOM_MODE, active_schedule("charge", charge_watts), "charge override"
+    if action == "discharge":
+        return CUSTOM_MODE, active_schedule("discharge", discharge_watts), "discharge override"
+    raise ValueError(f"Unsupported action: {action}")
 
 
 class SolplanetClient:
@@ -168,10 +277,9 @@ class SolplanetClient:
         return self._send(request)
 
     def post_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
-        data = json.dumps(payload).encode("utf-8")
         request = Request(
             f"{self.base_url}/{endpoint}",
-            data=data,
+            data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -181,43 +289,19 @@ class SolplanetClient:
         last_exc: Exception | None = None
         for attempt in range(self.request_retries + 1):
             try:
-                with urlopen(
-                    request,
-                    timeout=self.timeout_seconds,
-                    context=self.ssl_context,
-                ) as response:
+                with urlopen(request, timeout=self.timeout_seconds, context=self.ssl_context) as response:
                     return json.loads(response.read().decode("utf-8"))
             except HTTPError as exc:
                 last_exc = exc
             except URLError as exc:
                 last_exc = exc
-
             if attempt < self.request_retries:
                 time.sleep(self.retry_delay_seconds)
-
         if isinstance(last_exc, HTTPError):
             raise RuntimeError(f"HTTP error from inverter: {last_exc.code}") from last_exc
         if isinstance(last_exc, URLError):
             raise RuntimeError(f"Network error talking to inverter: {last_exc.reason}") from last_exc
         raise RuntimeError("Unknown inverter communication error")
-
-
-@dataclass(frozen=True)
-class AmberPriceSnapshot:
-    site_id: str
-    nem_time: str
-    per_kwh: float
-    descriptor: str
-    interval_type: str
-    channel_type: str
-    demand_window: bool | None
-
-
-@dataclass(frozen=True)
-class AmberDecisionSnapshot:
-    general: AmberPriceSnapshot
-    feed_in: AmberPriceSnapshot | None
-    action: str
 
 
 class AmberClient:
@@ -231,220 +315,211 @@ class AmberClient:
         self.request_retries = request_retries
         self.retry_delay_seconds = retry_delay_seconds
 
-    def get_current_prices_by_channel(
-        self,
-        site_id: str,
-        resolution: int = 5,
-    ) -> dict[str, AmberPriceSnapshot]:
+    def _with_api(self, callback: Any) -> Any:
         last_exc: Exception | None = None
         for attempt in range(self.request_retries + 1):
             try:
                 configuration = Configuration(access_token=self.api_key)
                 with ApiClient(configuration) as api_client:
-                    api = AmberApi(api_client)
-                    intervals = api.get_current_prices(
-                        site_id,
-                        previous=0,
-                        next=0,
-                        resolution=resolution,
-                    )
-                break
+                    return callback(AmberApi(api_client))
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 if attempt < self.request_retries:
                     time.sleep(self.retry_delay_seconds)
                 else:
                     raise RuntimeError(f"Amber API error: {exc}") from exc
-        if not intervals:
-            raise RuntimeError("Amber returned no current price intervals")
-        snapshots: dict[str, AmberPriceSnapshot] = {}
+        raise RuntimeError(f"Amber API error: {last_exc}")
+
+    def get_price_horizon(self, site_id: str, interval_minutes: int, horizon_intervals: int) -> list[AmberPriceSnapshot]:
+        intervals = self._with_api(
+            lambda api: api.get_current_prices(
+                site_id,
+                previous=0,
+                next=max(horizon_intervals - 1, 0),
+                resolution=interval_minutes,
+            )
+        )
+        grouped: dict[datetime, dict[str, Any]] = {}
         for interval in intervals:
             actual = interval.actual_instance
-            channel_type = str(actual.channel_type.value)
-            snapshots[channel_type] = AmberPriceSnapshot(
-                site_id=site_id,
-                nem_time=actual.nem_time.isoformat(),
-                per_kwh=float(actual.per_kwh),
-                descriptor=str(actual.descriptor.value),
-                interval_type=str(actual.type),
-                channel_type=channel_type,
-                demand_window=None
-                if actual.tariff_information is None
-                else bool(actual.tariff_information.demand_window),
+            end_time = actual.end_time.astimezone()
+            bucket = grouped.setdefault(end_time, {})
+            bucket[str(actual.channel_type.value)] = actual
+
+        prices: list[AmberPriceSnapshot] = []
+        for end_time in sorted(grouped):
+            bucket = grouped[end_time]
+            general = bucket.get("general")
+            if general is None:
+                continue
+            feed_in = bucket.get("feedIn")
+            demand_window = False
+            if general.tariff_information is not None:
+                demand_window = bool(general.tariff_information.demand_window)
+            prices.append(
+                AmberPriceSnapshot(
+                    site_id=site_id,
+                    start_time=general.start_time.astimezone(),
+                    end_time=general.end_time.astimezone(),
+                    duration_minutes=int(general.duration),
+                    general_per_kwh=float(general.per_kwh),
+                    general_descriptor=str(general.descriptor.value),
+                    feed_in_per_kwh=None if feed_in is None else float(feed_in.per_kwh),
+                    feed_in_descriptor=None if feed_in is None else str(feed_in.descriptor.value),
+                    demand_window=demand_window,
+                )
             )
-        return snapshots
+        return prices[:horizon_intervals]
 
 
-def current_slot(now: datetime | None = None) -> Slot:
-    """Return a backdated 1-hour slot so remaining runtime is usually <= 30 minutes.
-
-    The slot start is shifted back by one half-hour relative to the current half-hour
-    bucket. The only exception is the first half-hour after midnight, where we clamp
-    to `00:00-01:00` rather than attempting to write a previous-day slot.
-    """
-    now = now or datetime.now().astimezone()
-    if now.hour == 0 and now.minute < 30:
-        return Slot(
-            day=DAYS[now.weekday()],
-            start_hour=0,
-            start_minute=0,
-            duration_hours=1,
-            mode="charge",
+def load_battery_snapshot(client: SolplanetClient, battery_sn: str) -> BatterySnapshot:
+    try:
+        battery_data = client.get_json(f"getdevdata.cgi?device=4&sn={battery_sn}")
+        return BatterySnapshot(
+            soc=int(battery_data["soc"]),
+            battery_power_watts=int(battery_data.get("pb", 0)),
+            battery_voltage_raw=int(battery_data.get("vb", 0)),
+            battery_current_raw=int(battery_data.get("cb", 0)),
         )
-
-    day = DAYS[now.weekday()]
-    if now.minute < 30:
-        return Slot(
-            day=day,
-            start_hour=now.hour - 1,
-            start_minute=30,
-            duration_hours=1,
-            mode="charge",
-        )
-    return Slot(
-        day=day,
-        start_hour=now.hour,
-        start_minute=0,
-        duration_hours=1,
-        mode="charge",
-    )
+    except Exception as exc:  # noqa: BLE001
+        raise InverterUnavailableError(f"Failed to read battery telemetry: {exc}") from exc
 
 
-def empty_schedule(pin: int = 0, pout: int = 0) -> dict[str, Any]:
-    schedule: dict[str, Any] = {"Pin": pin, "Pout": pout}
-    for day in DAYS:
-        schedule[day] = [0, 0, 0, 0, 0, 0]
-    return schedule
-
-
-def active_schedule(mode: str, watts: int, now: datetime | None = None) -> dict[str, Any]:
-    slot = current_slot(now)
-    slot = Slot(
-        day=slot.day,
-        start_hour=slot.start_hour,
-        start_minute=slot.start_minute,
-        duration_hours=1,
-        mode=mode,
-    )
-    schedule = empty_schedule(
-        pin=watts if mode == "charge" else 0,
-        pout=watts if mode == "discharge" else 0,
-    )
-    schedule[slot.day][0] = slot.to_raw()
-    return schedule
-
-
-def charge_slot_allowed(now: datetime | None = None) -> bool:
-    """Return whether a backdated charge slot can stay fully before 3pm local time."""
-    now = now or datetime.now().astimezone()
-    slot = current_slot(now)
-    end_hour = slot.start_hour + 1
-    return end_hour <= DEMAND_WINDOW_START_HOUR
-
-
-def build_setbattery_payload(
-    battery_info: dict[str, Any],
-    battery_sn: str,
-    mode_register: int,
-) -> dict[str, Any]:
-    return {
-        "value": {
-            "type": battery_info["type"],
-            "mod_r": mode_register,
-            "sn": battery_sn,
-            "discharge_max": battery_info["discharge_max"],
-            "charge_max": battery_info["charge_max"],
-            "muf": battery_info["muf"],
-            "mod": battery_info["mod"],
-            "num": battery_info["num"],
+def log_battery_snapshot(snapshot: BatterySnapshot) -> None:
+    log_json(
+        "battery_state",
+        {
+            "battery_soc": snapshot.soc,
+            "battery_power_watts": snapshot.battery_power_watts,
+            "battery_voltage_raw": snapshot.battery_voltage_raw,
+            "battery_current_raw": snapshot.battery_current_raw,
         },
-        "device": BATTERY_DEVICE,
-        "action": ACTION_SET_BATTERY,
-    }
-
-
-def build_setdefine_payload(schedule: dict[str, Any]) -> dict[str, Any]:
-    return {"value": schedule, "device": BATTERY_DEVICE, "action": ACTION_SET_DEFINE}
-
-
-def desired_state(
-    action: str,
-    charge_watts: int,
-    discharge_watts: int,
-) -> tuple[int, dict[str, Any], str]:
-    if action == "fallback":
-        return SELF_CONSUMPTION_MODE, empty_schedule(), "fallback to self-consumption"
-    if action == "discharge":
-        return CUSTOM_MODE, active_schedule("discharge", discharge_watts), "discharge override"
-    if action == "charge":
-        return CUSTOM_MODE, active_schedule("charge", charge_watts), "charge override"
-    raise ValueError(f"Unsupported action: {action}")
-
-
-def decide_from_amber_prices(
-    general: AmberPriceSnapshot,
-    feed_in: AmberPriceSnapshot | None,
-) -> AmberDecisionSnapshot:
-    if general.demand_window:
-        return AmberDecisionSnapshot(
-            general=general,
-            feed_in=feed_in,
-            action="fallback",
-        )
-
-    if general.descriptor in {"negative", "extremelyLow"}:
-        return AmberDecisionSnapshot(
-            general=general,
-            feed_in=feed_in,
-            action="charge",
-        )
-
-    if feed_in is not None and (
-        feed_in.descriptor == "spike"
-        or (feed_in.descriptor == "high" and feed_in.per_kwh <= DEFAULT_MIN_DISCHARGE_FEED_IN_PRICE)
-    ):
-        return AmberDecisionSnapshot(
-            general=general,
-            feed_in=feed_in,
-            action="discharge",
-        )
-
-    return AmberDecisionSnapshot(
-        general=general,
-        feed_in=feed_in,
-        action="fallback",
     )
 
 
-def apply_soc_gates(
-    action: str,
-    soc: int,
-    general_per_kwh: float | None,
-    charge_target_soc: int,
-    discharge_target_soc: int,
-    high_soc_charge_threshold: int,
-    high_soc_cheap_price: float,
-) -> str:
-    if action == "charge" and soc >= charge_target_soc:
-        return "fallback"
-    if (
-        action == "charge"
-        and soc >= high_soc_charge_threshold
-        and (general_per_kwh is None or general_per_kwh >= high_soc_cheap_price)
-    ):
-        return "fallback"
-    if action == "discharge" and soc <= discharge_target_soc:
-        return "fallback"
-    return action
+def build_manual_price_horizon(args: argparse.Namespace) -> list[AmberPriceSnapshot]:
+    now = datetime.now().astimezone().replace(second=0, microsecond=0)
+    interval_delta = timedelta(minutes=args.planner_interval_minutes)
+    prices: list[AmberPriceSnapshot] = []
+    interval_count = max(1, (args.planner_horizon_hours * 60) // args.planner_interval_minutes)
+    for index in range(interval_count):
+        start_time = now + (index * interval_delta)
+        end_time = start_time + interval_delta
+        prices.append(
+            AmberPriceSnapshot(
+                site_id="manual",
+                start_time=start_time,
+                end_time=end_time,
+                duration_minutes=args.planner_interval_minutes,
+                general_per_kwh=args.general_per_kwh,
+                general_descriptor="manual",
+                feed_in_per_kwh=None,
+                feed_in_descriptor=None,
+                demand_window=False,
+            )
+        )
+    return prices
 
 
-def apply_charge_window_guard(action: str, now: datetime | None = None) -> str:
-    """Prevent charge schedules from extending into the 3pm demand window."""
-    if action != "charge":
-        return action
-    if not charge_slot_allowed(now):
-        return "fallback"
-    return action
+def build_price_only_charge_plan(
+    battery: BatterySnapshot,
+    prices: list[AmberPriceSnapshot],
+    args: argparse.Namespace,
+) -> ControlPlan:
+    if not prices:
+        raise PlannerUnavailableError("No Amber forecast intervals available")
+    if args.battery_capacity_kwh <= 0:
+        raise PlannerUnavailableError("Battery capacity must be positive")
+    if args.planner_charge_kwh_per_minute <= 0:
+        raise PlannerUnavailableError("Planner charge kWh per minute must be positive")
+
+    current_energy_kwh = (battery.soc / 100.0) * args.battery_capacity_kwh
+    target_energy_kwh = (args.charge_target_soc / 100.0) * args.battery_capacity_kwh
+    required_energy_kwh = max(0.0, target_energy_kwh - current_energy_kwh)
+    required_charge_minutes = required_energy_kwh / args.planner_charge_kwh_per_minute if required_energy_kwh > 0 else 0.0
+
+    eligible_prices = [price for price in prices if not price.demand_window]
+    selected_energy_by_end: dict[datetime, float] = {}
+    selected_minutes_by_end: dict[datetime, float] = {}
+    remaining_energy_kwh = required_energy_kwh
+    for price in sorted(eligible_prices, key=lambda item: (item.general_per_kwh, item.start_time)):
+        if remaining_energy_kwh <= 0:
+            break
+        interval_capacity_kwh = args.planner_charge_kwh_per_minute * price.duration_minutes
+        selected_kwh = min(interval_capacity_kwh, remaining_energy_kwh)
+        if selected_kwh <= 0:
+            continue
+        selected_energy_by_end[price.end_time] = selected_kwh
+        selected_minutes_by_end[price.end_time] = selected_kwh / args.planner_charge_kwh_per_minute
+        remaining_energy_kwh -= selected_kwh
+
+    steps: list[ControlPlanStep] = []
+    projected_energy_kwh = current_energy_kwh
+    total_planned_charge_kwh = 0.0
+    total_planned_charge_minutes = 0.0
+    total_cost = 0.0
+    for price in prices:
+        selected_kwh = selected_energy_by_end.get(price.end_time, 0.0)
+        selected_minutes = selected_minutes_by_end.get(price.end_time, 0.0)
+        action = "charge" if selected_kwh > 0 else "fallback"
+        expected_grid_kw = (args.charge_watts / 1000.0) if action == "charge" else 0.0
+        expected_cost = selected_kwh * cents_per_kwh_to_dollars(price.general_per_kwh)
+        projected_energy_kwh = min(target_energy_kwh, projected_energy_kwh + selected_kwh)
+        projected_soc = int(round((projected_energy_kwh / args.battery_capacity_kwh) * 100.0))
+        total_planned_charge_kwh += selected_kwh
+        total_planned_charge_minutes += selected_minutes
+        total_cost += expected_cost
+        steps.append(
+            ControlPlanStep(
+                interval_start=price.start_time,
+                interval_end=price.end_time,
+                duration_minutes=price.duration_minutes,
+                action=action,
+                planned_charge_kwh=round(selected_kwh, 4),
+                planned_charge_minutes=round(selected_minutes, 4),
+                expected_grid_kw=expected_grid_kw,
+                expected_cost=round(expected_cost, 4),
+                projected_soc=projected_soc,
+            )
+        )
+
+    average_price_c_per_kwh = 0.0
+    if total_planned_charge_kwh > 0:
+        average_price_c_per_kwh = (total_cost / total_planned_charge_kwh) * 100.0
+
+    return ControlPlan(
+        action=steps[0].action,
+        steps=steps,
+        required_energy_kwh=round(required_energy_kwh, 4),
+        required_charge_minutes=round(required_charge_minutes, 4),
+        planned_charge_kwh=round(total_planned_charge_kwh, 4),
+        planned_charge_minutes=round(total_planned_charge_minutes, 4),
+        estimated_total_charge_cost=round(total_cost, 2),
+        average_planned_charge_price_c_per_kwh=round(average_price_c_per_kwh, 3),
+        selected_interval_count=sum(1 for step in steps if step.action == "charge"),
+        target_reachable=total_planned_charge_kwh + 1e-6 >= required_energy_kwh,
+        planner_summary=(
+            f"price_only selected {steps[0].action} required_energy_kwh={required_energy_kwh:.3f} "
+            f"planned_charge_kwh={total_planned_charge_kwh:.3f}"
+        ),
+    )
+
+
+def build_hourly_plan_preview(steps: list[ControlPlanStep], hours: int = 24) -> tuple[str, list[int], str | None]:
+    if not steps:
+        return "", [], None
+    start_hour = steps[0].interval_start.replace(minute=0, second=0, microsecond=0)
+    hourly_actions = [0] * hours
+    next_charge_at: str | None = None
+    for step in steps:
+        if step.action != "charge":
+            continue
+        if next_charge_at is None:
+            next_charge_at = step.interval_start.isoformat()
+        hour_index = int((step.interval_start - start_hour).total_seconds() // 3600)
+        if 0 <= hour_index < hours:
+            hourly_actions[hour_index] = 1
+    return start_hour.isoformat(), hourly_actions, next_charge_at
 
 
 def apply_state(
@@ -456,16 +531,8 @@ def apply_state(
     apply: bool,
 ) -> None:
     battery_info = client.get_json(f"getdev.cgi?device=4&sn={battery_sn}")
-    mode_register, schedule, description = desired_state(
-        action=action,
-        charge_watts=charge_watts,
-        discharge_watts=discharge_watts,
-    )
-    mode_payload = build_setbattery_payload(
-        battery_info=battery_info,
-        battery_sn=battery_sn,
-        mode_register=mode_register,
-    )
+    mode_register, schedule, description = desired_state(action, charge_watts, discharge_watts)
+    mode_payload = build_setbattery_payload(battery_info, battery_sn, mode_register)
     schedule_payload = build_setdefine_payload(schedule)
 
     if not apply:
@@ -473,7 +540,6 @@ def apply_state(
         return
 
     try:
-        # Clear stale schedule first so fallback and overrides are deterministic.
         schedule_response = client.post_json("setting.cgi", schedule_payload)
         mode_response = client.post_json("setting.cgi", mode_payload)
     except Exception as exc:  # noqa: BLE001
@@ -484,6 +550,7 @@ def apply_state(
         confirmed_schedule = client.get_json("getdefine.cgi")
     except Exception as exc:  # noqa: BLE001
         raise InverterUnavailableError(f"Failed to confirm inverter state after write: {exc}") from exc
+
     log_json(
         "applied",
         {
@@ -500,125 +567,89 @@ def apply_state(
 
 def run_once(args: argparse.Namespace) -> None:
     client = SolplanetClient(host=args.host)
+    battery = load_battery_snapshot(client, args.battery_sn)
+    log_battery_snapshot(battery)
+
     try:
-        battery_data = client.get_json(f"getdevdata.cgi?device=4&sn={args.battery_sn}")
-        soc = int(battery_data["soc"])
-        battery_power_watts = int(battery_data.get("pb", 0))
-        battery_voltage_raw = int(battery_data.get("vb", 0))
-        battery_current_raw = int(battery_data.get("cb", 0))
-    except Exception as exc:  # noqa: BLE001
-        raise InverterUnavailableError(f"Failed to read battery telemetry: {exc}") from exc
-
-    log_json(
-        "battery_state",
-        {
-            "battery_soc": soc,
-            "battery_power_watts": battery_power_watts,
-            "battery_voltage_raw": battery_voltage_raw,
-            "battery_current_raw": battery_current_raw,
-        },
-    )
-
-    action = "fallback"
-    amber_error: str | None = None
-    if args.price_source == "amber":
-        try:
+        if args.price_source == "amber":
             amber_api_key = env_or_default("AMBER_API_KEY", DEFAULT_AMBER_API_KEY)
             if not amber_api_key:
-                raise RuntimeError("AMBER_API_KEY is not configured")
+                raise PlannerUnavailableError("AMBER_API_KEY is not configured")
             amber_client = AmberClient(api_key=amber_api_key)
-            amber_prices = amber_client.get_current_prices_by_channel(site_id=args.amber_site_id)
-            general_price = amber_prices.get("general")
-            if general_price is None:
-                raise RuntimeError("Amber returned no current general price")
-            feed_in_price = amber_prices.get("feedIn")
-            amber_decision = decide_from_amber_prices(
-                general=general_price,
-                feed_in=feed_in_price,
+            prices = amber_client.get_price_horizon(
+                site_id=args.amber_site_id,
+                interval_minutes=args.planner_interval_minutes,
+                horizon_intervals=max(1, (args.planner_horizon_hours * 60) // args.planner_interval_minutes),
             )
-            action = amber_decision.action
-            gated_action = apply_soc_gates(
-                action=action,
-                soc=soc,
-                general_per_kwh=amber_decision.general.per_kwh,
-                charge_target_soc=args.charge_target_soc,
-                discharge_target_soc=args.discharge_target_soc,
-                high_soc_charge_threshold=args.high_soc_charge_threshold,
-                high_soc_cheap_price=args.high_soc_cheap_price,
-            )
-            final_action = apply_charge_window_guard(gated_action)
-            log_json(
-                "decision",
-                {
-                    "source": "amber",
-                    "battery_soc": soc,
-                    "general_descriptor": amber_decision.general.descriptor,
-                    "general_per_kwh": amber_decision.general.per_kwh,
-                    "general_demand_window": amber_decision.general.demand_window,
-                    "feed_in_descriptor": None if amber_decision.feed_in is None else amber_decision.feed_in.descriptor,
-                    "feed_in_per_kwh": None if amber_decision.feed_in is None else amber_decision.feed_in.per_kwh,
-                    "derived_action": action,
-                    "final_action": final_action,
-                },
-            )
-            action = final_action
-        except Exception as exc:  # noqa: BLE001
-            amber_error = str(exc)
-            action = "fallback"
-            log_json(
-                "amber_error",
-                {
-                    "amber_error": amber_error,
-                    "battery_soc": soc,
-                    "fallback_action": action,
-                },
-            )
-    else:
-        manual_general = AmberPriceSnapshot(
-            site_id="manual",
-            nem_time="manual",
-            per_kwh=args.general_per_kwh,
-            descriptor=args.general_descriptor,
-            interval_type="manual",
-            channel_type="general",
-            demand_window=False,
-        )
-        manual_feed_in = AmberPriceSnapshot(
-            site_id="manual",
-            nem_time="manual",
-            per_kwh=0.0,
-            descriptor=args.feed_in_descriptor,
-            interval_type="manual",
-            channel_type="feedIn",
-            demand_window=None,
-        )
-        manual_decision = decide_from_amber_prices(
-            general=manual_general,
-            feed_in=manual_feed_in,
-        )
-        action = apply_soc_gates(
-            action=manual_decision.action,
-            soc=soc,
-            general_per_kwh=manual_general.per_kwh,
-            charge_target_soc=args.charge_target_soc,
-            discharge_target_soc=args.discharge_target_soc,
-            high_soc_charge_threshold=args.high_soc_charge_threshold,
-            high_soc_cheap_price=args.high_soc_cheap_price,
-        )
-        action = apply_charge_window_guard(action)
+            source = "amber_price_plan"
+        else:
+            prices = build_manual_price_horizon(args)
+            source = "manual_price_plan"
+
+        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args)
+        current_interval = prices[0]
+        derived_action = plan.action
+        final_action = derived_action
+        if derived_action == "charge" and not charge_slot_allowed():
+            final_action = "fallback"
+
+        plan_hourly_start, plan_hourly_actions, next_charge_at = build_hourly_plan_preview(plan.steps)
+
         log_json(
             "decision",
             {
-                "source": "manual",
-                "general": args.general_descriptor,
-                "general_per_kwh": args.general_per_kwh,
-                "feed_in": args.feed_in_descriptor,
-                "general_demand_window": False,
-                "battery_soc": soc,
-                "derived_action": manual_decision.action,
-                "final_action": action,
+                "source": source,
+                "battery_soc": battery.soc,
+                "planner_summary": plan.planner_summary,
+                "forecast_general_per_kwh": current_interval.general_per_kwh,
+                "forecast_feed_in_per_kwh": current_interval.feed_in_per_kwh,
+                "current_forecast_interval_minutes": current_interval.duration_minutes,
+                "planner_charge_kwh_per_minute": round(args.planner_charge_kwh_per_minute, 6),
+                "command_charge_watts": args.charge_watts,
+                "required_energy_kwh": plan.required_energy_kwh,
+                "required_charge_minutes": plan.required_charge_minutes,
+                "planned_charge_kwh": plan.planned_charge_kwh,
+                "planned_charge_minutes": plan.planned_charge_minutes,
+                "estimated_total_charge_cost": plan.estimated_total_charge_cost,
+                "average_planned_charge_price_c_per_kwh": plan.average_planned_charge_price_c_per_kwh,
+                "selected_interval_count": plan.selected_interval_count,
+                "target_reachable": plan.target_reachable,
+                "projected_soc": plan.steps[0].projected_soc,
+                "derived_action": derived_action,
+                "final_action": final_action,
             },
         )
+        log_json(
+            "plan_preview",
+            {
+                "source": source,
+                "current_action": final_action,
+                "feasible_plan_through": plan.steps[-1].interval_end.isoformat(),
+                "plan_hourly_start": plan_hourly_start,
+                "plan_hourly_actions": plan_hourly_actions,
+                "next_charge_at": next_charge_at,
+                "required_energy_kwh": plan.required_energy_kwh,
+                "required_charge_minutes": plan.required_charge_minutes,
+                "estimated_total_charge_kwh": plan.planned_charge_kwh,
+                "estimated_total_charge_minutes": plan.planned_charge_minutes,
+                "estimated_total_charge_cost": plan.estimated_total_charge_cost,
+                "average_planned_charge_price_c_per_kwh": plan.average_planned_charge_price_c_per_kwh,
+                "selected_interval_count": plan.selected_interval_count,
+                "target_reachable": plan.target_reachable,
+            },
+        )
+        action = final_action
+    except Exception as exc:  # noqa: BLE001
+        action = "fallback"
+        log_json(
+            "planner_fallback",
+            {
+                "battery_soc": battery.soc,
+                "message": str(exc),
+                "fallback_action": action,
+            },
+        )
+
     apply_state(
         client=client,
         battery_sn=args.battery_sn,
@@ -630,105 +661,44 @@ def run_once(args: argparse.Namespace) -> None:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Minimal Solplanet price-state controller."
-    )
-    parser.add_argument(
-        "--price-source",
-        choices=["manual", "amber"],
-        default=DEFAULT_PRICE_SOURCE,
-        help="Use hardcoded Amber descriptors or derive them from Amber current pricing.",
-    )
-    parser.add_argument(
-        "--general-descriptor",
-        choices=AMBER_DESCRIPTORS,
-        default="neutral",
-        help="Hardcoded Amber general descriptor for testing when --price-source=manual.",
-    )
-    parser.add_argument(
-        "--feed-in-descriptor",
-        choices=AMBER_DESCRIPTORS,
-        default="neutral",
-        help="Hardcoded Amber feed-in descriptor for testing when --price-source=manual.",
-    )
-    parser.add_argument(
-        "--general-per-kwh",
-        type=float,
-        default=0.0,
-        help="Hardcoded Amber general import price in c/kWh for testing when --price-source=manual.",
-    )
-    parser.add_argument(
-        "--host",
-        default=env_or_default("SOLPLANET_HOST", DEFAULT_HOST),
-        help="Solplanet inverter host.",
-    )
-    parser.add_argument(
-        "--battery-sn",
-        default=env_or_default("SOLPLANET_BATTERY_SN", DEFAULT_BATTERY_SN),
-        help="Battery serial number.",
-    )
+    parser = argparse.ArgumentParser(description="Amber forecast-driven Solplanet battery charger.")
+    parser.add_argument("--price-source", choices=["manual", "amber"], default=DEFAULT_PRICE_SOURCE)
+    parser.add_argument("--general-per-kwh", type=float, default=0.0, help="Manual import price in c/kWh.")
+    parser.add_argument("--host", default=env_or_default("SOLPLANET_HOST", DEFAULT_HOST), help="Solplanet inverter host.")
+    parser.add_argument("--battery-sn", default=env_or_default("SOLPLANET_BATTERY_SN", DEFAULT_BATTERY_SN))
     parser.add_argument(
         "--charge-watts",
         type=int,
         default=DEFAULT_CHARGE_WATTS,
-        help="Charge power used for extremely_low.",
+        help="Grid-charge command power in watts, including house-load headroom.",
+    )
+    parser.add_argument(
+        "--planner-charge-kwh-per-minute",
+        type=float,
+        default=DEFAULT_PLANNER_CHARGE_KWH_PER_MINUTE,
+        help="Battery charge rate normalized to kWh per minute for planning.",
     )
     parser.add_argument(
         "--discharge-watts",
         type=int,
         default=DEFAULT_DISCHARGE_WATTS,
-        help="Discharge power used for low.",
+        help="Unused by the minimal planner; retained for inverter state application.",
     )
+    parser.add_argument("--charge-target-soc", type=int, default=DEFAULT_CHARGE_TARGET_SOC)
+    parser.add_argument("--battery-capacity-kwh", type=float, default=DEFAULT_BATTERY_CAPACITY_KWH)
+    parser.add_argument("--planner-horizon-hours", type=int, default=DEFAULT_PLANNER_HORIZON_HOURS)
     parser.add_argument(
-        "--charge-target-soc",
+        "--planner-interval-minutes",
         type=int,
-        default=DEFAULT_CHARGE_TARGET_SOC,
-        help="Stop charging and fall back once battery SOC reaches this percentage.",
+        default=DEFAULT_PLANNER_INTERVAL_MINUTES,
+        choices=[5, 15, 30],
+        help="Amber forecast resolution to request.",
     )
-    parser.add_argument(
-        "--discharge-target-soc",
-        type=int,
-        default=DEFAULT_DISCHARGE_TARGET_SOC,
-        help="Stop discharging and fall back once battery SOC falls to this percentage.",
-    )
-    parser.add_argument(
-        "--high-soc-charge-threshold",
-        type=int,
-        default=DEFAULT_HIGH_SOC_CHARGE_THRESHOLD,
-        help="Require a cheaper import price before charging once battery SOC reaches this percentage.",
-    )
-    parser.add_argument(
-        "--high-soc-cheap-price",
-        type=float,
-        default=DEFAULT_HIGH_SOC_CHEAP_PRICE,
-        help="Maximum import price in c/kWh allowed for charging at or above the high-SOC threshold.",
-    )
-    parser.add_argument(
-        "--amber-site-id",
-        default=env_or_default("AMBER_SITE_ID", DEFAULT_AMBER_SITE_ID),
-        help="Amber site id for current price fetches.",
-    )
-    parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Actually write changes to the inverter. Default is dry-run.",
-    )
-    parser.add_argument(
-        "--loop",
-        action="store_true",
-        help="Run continuously instead of a single control cycle.",
-    )
-    parser.add_argument(
-        "--loop-seconds",
-        type=int,
-        default=DEFAULT_LOOP_SECONDS,
-        help="Sleep interval between control cycles when --loop is enabled.",
-    )
-    parser.add_argument(
-        "--log-file",
-        default=DEFAULT_LOG_FILE,
-        help="Append-only log file path.",
-    )
+    parser.add_argument("--amber-site-id", default=env_or_default("AMBER_SITE_ID", DEFAULT_AMBER_SITE_ID))
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--loop-seconds", type=int, default=DEFAULT_LOOP_SECONDS)
+    parser.add_argument("--log-file", default=DEFAULT_LOG_FILE)
     return parser.parse_args(argv)
 
 
@@ -740,37 +710,15 @@ def main(argv: list[str]) -> int:
         if not args.loop:
             run_once(args)
             return 0
-
         while True:
             try:
                 run_once(args)
             except InverterUnavailableError as exc:
-                log_json(
-                    "error",
-                    {
-                        "cycle_error": "inverter_unavailable",
-                        "message": str(exc),
-                        "next_action": "retry_next_cycle",
-                    },
-                )
+                log_json("error", {"cycle_error": "inverter_unavailable", "message": str(exc), "next_action": "retry_next_cycle"})
             except InverterWriteError as exc:
-                log_json(
-                    "error",
-                    {
-                        "cycle_error": "inverter_write_failed",
-                        "message": str(exc),
-                        "next_action": "retry_next_cycle",
-                    },
-                )
+                log_json("error", {"cycle_error": "inverter_write_failed", "message": str(exc), "next_action": "retry_next_cycle"})
             except Exception as exc:  # noqa: BLE001
-                log_json(
-                    "error",
-                    {
-                        "cycle_error": "unexpected",
-                        "message": str(exc),
-                        "next_action": "retry_next_cycle",
-                    },
-                )
+                log_json("error", {"cycle_error": "unexpected", "message": str(exc), "next_action": "retry_next_cycle"})
             time.sleep(args.loop_seconds)
     except KeyboardInterrupt:
         log_json("stopped", {"message": "Stopped by user"})
@@ -778,7 +726,6 @@ def main(argv: list[str]) -> int:
     except Exception as exc:  # noqa: BLE001
         log_json("fatal_error", {"message": str(exc)})
         return 1
-    return 0
 
 
 if __name__ == "__main__":

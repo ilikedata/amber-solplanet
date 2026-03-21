@@ -4,59 +4,41 @@
 
 This repository contains a small local controller for **Solplanet battery/inverter systems** on **Amber Electric** pricing.
 
-It exists for a specific use case: you want battery behavior to respond to Amber price signals, but you do not want to depend on Home Assistant or a larger automation stack to do it.
-
-## Links
-
-- Heavily inspired by [Home Assistant Integration](https://github.com/calvinbui/home-assistant-solplanet) - I was having trouble with HACS so wrote my own.
-
-## Problem
-
-Solplanet exposes a local HTTP API, and Amber exposes current price and tariff metadata, but there is no simple built-in controller that ties the two together for:
-
-- charging on very cheap import pricing
-- discharging on favorable feed-in pricing
-- respecting demand windows
-- keeping battery SOC within practical bounds
-- failing safely when communications are unreliable
-
-This repository is that controller.
+It plans **grid charging only** from the Amber forecast at the **lowest forecast cost**, while excluding the daily demand window.
 
 ## What The Controller Does
 
 On each loop, the controller:
 
 1. reads battery telemetry from the local Solplanet API
-2. reads current Amber price intervals
-3. decides whether to `charge`, `discharge`, or `fallback`
-4. applies that decision using the local Solplanet control API
+2. fetches the Amber forecast horizon
+3. calculates required battery energy to reach the target SOC
+4. converts the planner charge rate into **kWh per minute**
+5. selects the cheapest non-demand-window Amber intervals until that energy is covered
+6. allows a **partial final interval** for the last bit of required energy
+7. decides whether the current interval should `charge` or `fallback`
+8. applies only the current short-lived action using the local Solplanet control API
 
 The fallback action is **self-consumption mode**.
 
 ## Control Approach
 
-The controller is intentionally simple and conservative.
+The planner is intentionally minimal.
 
 It uses:
 
-- **Amber general pricing** to decide when charging is allowed
-- **Amber feed-in pricing** to decide when discharge/export is attractive
-- **battery SOC guards** to stop charge/discharge outside configured bounds
-- **high-SOC price guards** so charging above 70% SOC only happens when import pricing is below 5 c/kWh by default
-- **demand-window guards** so charge windows do not run into the daily demand period
-- **short, backdated schedule windows** so stale commands naturally expire quickly if comms fail
+- Amber forecast prices only
+- actual Amber interval durations exactly as returned
+- battery capacity
+- a normalized planner charge rate in `kWh/min`
+- hard demand-window exclusion for charging
 
-That last point matters: this project is designed around the reality that inverter control can be unreliable. The scheduling strategy reduces the blast radius of missed updates.
+It does **not** use:
 
-## Why Someone Else Might Use This
-
-If you have the same ingredients:
-
-- Solplanet inverter with local API access
-- Amber Electric pricing
-- interest in battery arbitrage or price-aware battery control
-
-then this repository gives you a working starting point for local control without having to reverse-engineer the Solplanet control path from scratch.
+- household usage history
+- weather
+- solar forecasting
+- learned models
 
 ## Configuration
 
@@ -71,22 +53,31 @@ See [`.env.example`](/home/tai/svn/electricity/.env.example).
 
 Useful CLI tuning knobs:
 
+- `--battery-capacity-kwh` default `50.0`
+- `--planner-horizon-hours` default `24`
+- `--planner-interval-minutes` default `5`
+- `--charge-watts` default `15000`
+- `--planner-charge-kwh-per-minute` default `0.1693`
 - `--charge-target-soc` default `97`
-- `--discharge-target-soc` default `40`
-- `--high-soc-charge-threshold` default `70`
-- `--high-soc-cheap-price` default `5.0`
+
+`--charge-watts` is the inverter command used during charging. `--planner-charge-kwh-per-minute` is the battery fill rate used for energy and cost planning.
 
 ## Logging
 
-Runtime logs are written as **NDJSON** so the output can be analysed later for controller behavior and battery/arbitrage history.
+Runtime logs are written as **NDJSON**.
 
-Typical event types include:
+Useful planner fields include:
 
-- `battery_state`
-- `decision`
-- `dry_run`
-- `applied`
-- `error`
+- `required_energy_kwh`
+- `required_charge_minutes`
+- `planned_charge_kwh`
+- `planned_charge_minutes`
+- `estimated_total_charge_cost`
+- `average_planned_charge_price_c_per_kwh`
+- `selected_interval_count`
+- `target_reachable`
+- `plan_hourly_actions`
+- `next_charge_at`
 
 ## Running
 
