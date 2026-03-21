@@ -30,7 +30,7 @@ DEFAULT_CHARGE_TARGET_SOC = 97
 DEFAULT_PRICE_SOURCE = "manual"
 DEFAULT_AMBER_SITE_ID = ""
 DEFAULT_AMBER_API_KEY = ""
-DEFAULT_LOOP_SECONDS = 300
+DEFAULT_LOOP_SECONDS = 60
 DEFAULT_REQUEST_RETRIES = 2
 DEFAULT_RETRY_DELAY_SECONDS = 2.0
 DEFAULT_LOG_FILE = "solplanet_price_controller.ndjson"
@@ -95,7 +95,6 @@ class BatterySnapshot:
 class ControlPlanStep:
     interval_start: datetime
     interval_end: datetime
-    duration_minutes: int
     action: str
     planned_charge_kwh: float
     planned_charge_minutes: float
@@ -105,17 +104,26 @@ class ControlPlanStep:
 
 
 @dataclass(frozen=True)
+class MinuteBucket:
+    parent_end_time: datetime
+    minute_start: datetime
+    general_per_kwh: float
+
+
+@dataclass(frozen=True)
 class ControlPlan:
     action: str
     steps: list[ControlPlanStep]
+    selected_minute_starts: tuple[datetime, ...]
     required_energy_kwh: float
     required_charge_minutes: float
     planned_charge_kwh: float
     planned_charge_minutes: float
     estimated_total_charge_cost: float
     average_planned_charge_price_c_per_kwh: float
-    selected_interval_count: int
+    selected_minute_count: int
     target_reachable: bool
+    next_charge_at: datetime | None
     planner_summary: str
 
 
@@ -171,6 +179,10 @@ def log_json(label: str, payload: dict[str, Any]) -> None:
 
 def cents_per_kwh_to_dollars(cents: float) -> float:
     return cents / 100.0
+
+
+def floor_to_minute(value: datetime) -> datetime:
+    return value.astimezone().replace(second=0, microsecond=0)
 
 
 def current_slot(now: datetime | None = None) -> Slot:
@@ -425,6 +437,7 @@ def build_price_only_charge_plan(
     battery: BatterySnapshot,
     prices: list[AmberPriceSnapshot],
     args: argparse.Namespace,
+    now: datetime | None = None,
 ) -> ControlPlan:
     if not prices:
         raise PlannerUnavailableError("No Amber forecast intervals available")
@@ -433,24 +446,47 @@ def build_price_only_charge_plan(
     if args.planner_charge_kwh_per_minute <= 0:
         raise PlannerUnavailableError("Planner charge kWh per minute must be positive")
 
+    now = floor_to_minute(now or datetime.now().astimezone())
     current_energy_kwh = (battery.soc / 100.0) * args.battery_capacity_kwh
     target_energy_kwh = (args.charge_target_soc / 100.0) * args.battery_capacity_kwh
     required_energy_kwh = max(0.0, target_energy_kwh - current_energy_kwh)
     required_charge_minutes = required_energy_kwh / args.planner_charge_kwh_per_minute if required_energy_kwh > 0 else 0.0
 
-    eligible_prices = [price for price in prices if not price.demand_window]
+    minute_buckets: list[MinuteBucket] = []
+    for price in prices:
+        if price.demand_window:
+            continue
+        interval_end = floor_to_minute(price.end_time)
+        interval_start = interval_end - timedelta(minutes=price.duration_minutes)
+        minute_start = max(interval_start, now)
+        while minute_start < interval_end:
+            minute_buckets.append(
+                MinuteBucket(
+                    parent_end_time=price.end_time,
+                    minute_start=minute_start,
+                    general_per_kwh=price.general_per_kwh,
+                )
+            )
+            minute_start += timedelta(minutes=1)
+
     selected_energy_by_end: dict[datetime, float] = {}
     selected_minutes_by_end: dict[datetime, float] = {}
+    selected_minute_buckets: set[datetime] = set()
+    next_charge_at: datetime | None = None
     remaining_energy_kwh = required_energy_kwh
-    for price in sorted(eligible_prices, key=lambda item: (item.general_per_kwh, item.start_time)):
+    for minute_bucket in sorted(minute_buckets, key=lambda item: (item.general_per_kwh, item.minute_start)):
         if remaining_energy_kwh <= 0:
             break
-        interval_capacity_kwh = args.planner_charge_kwh_per_minute * price.duration_minutes
-        selected_kwh = min(interval_capacity_kwh, remaining_energy_kwh)
+        selected_kwh = min(args.planner_charge_kwh_per_minute, remaining_energy_kwh)
         if selected_kwh <= 0:
             continue
-        selected_energy_by_end[price.end_time] = selected_kwh
-        selected_minutes_by_end[price.end_time] = selected_kwh / args.planner_charge_kwh_per_minute
+        selected_energy_by_end[minute_bucket.parent_end_time] = selected_energy_by_end.get(minute_bucket.parent_end_time, 0.0) + selected_kwh
+        selected_minutes_by_end[minute_bucket.parent_end_time] = selected_minutes_by_end.get(minute_bucket.parent_end_time, 0.0) + (
+            selected_kwh / args.planner_charge_kwh_per_minute
+        )
+        selected_minute_buckets.add(minute_bucket.minute_start)
+        if next_charge_at is None:
+            next_charge_at = minute_bucket.minute_start
         remaining_energy_kwh -= selected_kwh
 
     steps: list[ControlPlanStep] = []
@@ -473,7 +509,6 @@ def build_price_only_charge_plan(
             ControlPlanStep(
                 interval_start=price.start_time,
                 interval_end=price.end_time,
-                duration_minutes=price.duration_minutes,
                 action=action,
                 planned_charge_kwh=round(selected_kwh, 4),
                 planned_charge_minutes=round(selected_minutes, 4),
@@ -487,39 +522,44 @@ def build_price_only_charge_plan(
     if total_planned_charge_kwh > 0:
         average_price_c_per_kwh = (total_cost / total_planned_charge_kwh) * 100.0
 
+    current_minute_action = "charge" if now in selected_minute_buckets else "fallback"
+    sorted_selected_minutes = tuple(sorted(selected_minute_buckets))
+
     return ControlPlan(
-        action=steps[0].action,
+        action=current_minute_action,
         steps=steps,
+        selected_minute_starts=sorted_selected_minutes,
         required_energy_kwh=round(required_energy_kwh, 4),
         required_charge_minutes=round(required_charge_minutes, 4),
         planned_charge_kwh=round(total_planned_charge_kwh, 4),
         planned_charge_minutes=round(total_planned_charge_minutes, 4),
         estimated_total_charge_cost=round(total_cost, 2),
         average_planned_charge_price_c_per_kwh=round(average_price_c_per_kwh, 3),
-        selected_interval_count=sum(1 for step in steps if step.action == "charge"),
+        selected_minute_count=len(selected_minute_buckets),
         target_reachable=total_planned_charge_kwh + 1e-6 >= required_energy_kwh,
+        next_charge_at=next_charge_at,
         planner_summary=(
-            f"price_only selected {steps[0].action} required_energy_kwh={required_energy_kwh:.3f} "
+            f"price_only selected {current_minute_action} required_energy_kwh={required_energy_kwh:.3f} "
             f"planned_charge_kwh={total_planned_charge_kwh:.3f}"
         ),
     )
 
 
-def build_hourly_plan_preview(steps: list[ControlPlanStep], hours: int = 24) -> tuple[str, list[int], str | None]:
+def build_hourly_plan_preview(
+    steps: list[ControlPlanStep],
+    selected_minute_starts: tuple[datetime, ...],
+    next_charge_at: datetime | None,
+    hours: int = 24,
+) -> tuple[str, list[int], str | None]:
     if not steps:
         return "", [], None
     start_hour = steps[0].interval_start.replace(minute=0, second=0, microsecond=0)
     hourly_actions = [0] * hours
-    next_charge_at: str | None = None
-    for step in steps:
-        if step.action != "charge":
-            continue
-        if next_charge_at is None:
-            next_charge_at = step.interval_start.isoformat()
-        hour_index = int((step.interval_start - start_hour).total_seconds() // 3600)
+    for minute_start in selected_minute_starts:
+        hour_index = int((minute_start - start_hour).total_seconds() // 3600)
         if 0 <= hour_index < hours:
             hourly_actions[hour_index] = 1
-    return start_hour.isoformat(), hourly_actions, next_charge_at
+    return start_hour.isoformat(), hourly_actions, None if next_charge_at is None else next_charge_at.isoformat()
 
 
 def apply_state(
@@ -569,6 +609,7 @@ def run_once(args: argparse.Namespace) -> None:
     client = SolplanetClient(host=args.host)
     battery = load_battery_snapshot(client, args.battery_sn)
     log_battery_snapshot(battery)
+    now = datetime.now().astimezone()
 
     try:
         if args.price_source == "amber":
@@ -586,34 +627,28 @@ def run_once(args: argparse.Namespace) -> None:
             prices = build_manual_price_horizon(args)
             source = "manual_price_plan"
 
-        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args)
+        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args, now=now)
         current_interval = prices[0]
         derived_action = plan.action
         final_action = derived_action
         if derived_action == "charge" and not charge_slot_allowed():
             final_action = "fallback"
 
-        plan_hourly_start, plan_hourly_actions, next_charge_at = build_hourly_plan_preview(plan.steps)
+        plan_hourly_start, plan_hourly_actions, next_charge_at = build_hourly_plan_preview(
+            plan.steps,
+            plan.selected_minute_starts,
+            plan.next_charge_at,
+        )
 
         log_json(
             "decision",
             {
                 "source": source,
                 "battery_soc": battery.soc,
-                "planner_summary": plan.planner_summary,
                 "forecast_general_per_kwh": current_interval.general_per_kwh,
                 "forecast_feed_in_per_kwh": current_interval.feed_in_per_kwh,
-                "current_forecast_interval_minutes": current_interval.duration_minutes,
                 "planner_charge_kwh_per_minute": round(args.planner_charge_kwh_per_minute, 6),
                 "command_charge_watts": args.charge_watts,
-                "required_energy_kwh": plan.required_energy_kwh,
-                "required_charge_minutes": plan.required_charge_minutes,
-                "planned_charge_kwh": plan.planned_charge_kwh,
-                "planned_charge_minutes": plan.planned_charge_minutes,
-                "estimated_total_charge_cost": plan.estimated_total_charge_cost,
-                "average_planned_charge_price_c_per_kwh": plan.average_planned_charge_price_c_per_kwh,
-                "selected_interval_count": plan.selected_interval_count,
-                "target_reachable": plan.target_reachable,
                 "projected_soc": plan.steps[0].projected_soc,
                 "derived_action": derived_action,
                 "final_action": final_action,
@@ -634,7 +669,7 @@ def run_once(args: argparse.Namespace) -> None:
                 "estimated_total_charge_minutes": plan.planned_charge_minutes,
                 "estimated_total_charge_cost": plan.estimated_total_charge_cost,
                 "average_planned_charge_price_c_per_kwh": plan.average_planned_charge_price_c_per_kwh,
-                "selected_interval_count": plan.selected_interval_count,
+                "selected_minute_count": plan.selected_minute_count,
                 "target_reachable": plan.target_reachable,
             },
         )

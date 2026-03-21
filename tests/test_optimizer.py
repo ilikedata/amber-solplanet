@@ -50,7 +50,7 @@ class MinimalPlannerTests(unittest.TestCase):
             price("2026-03-21T21:30:00+11:00", "2026-03-21T22:00:00+11:00", 5.0),
         ]
 
-        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args)
+        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args, now=dt("2026-03-21T21:00:00+11:00"))
 
         self.assertEqual(plan.action, "fallback")
         self.assertAlmostEqual(plan.required_energy_kwh, 2.5, places=3)
@@ -59,7 +59,8 @@ class MinimalPlannerTests(unittest.TestCase):
         self.assertAlmostEqual(plan.planned_charge_minutes, 15.0, places=3)
         self.assertAlmostEqual(plan.estimated_total_charge_cost, 0.12, places=2)
         self.assertAlmostEqual(plan.average_planned_charge_price_c_per_kwh, 5.0, places=3)
-        self.assertEqual(plan.selected_interval_count, 1)
+        self.assertEqual(plan.selected_minute_count, 16)
+        self.assertEqual(plan.next_charge_at, dt("2026-03-21T21:30:00+11:00"))
 
     def test_mixed_5_and_30_min_intervals_are_handled_consistently(self) -> None:
         args = make_args()
@@ -70,14 +71,14 @@ class MinimalPlannerTests(unittest.TestCase):
             price("2026-03-22T12:00:00+11:00", "2026-03-22T12:30:00+11:00", 4.0),
         ]
 
-        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args)
+        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args, now=dt("2026-03-21T22:00:00+11:00"))
 
         self.assertEqual(plan.action, "fallback")
         self.assertAlmostEqual(plan.required_energy_kwh, 2.5, places=3)
         self.assertAlmostEqual(plan.planned_charge_kwh, 2.5, places=3)
         self.assertAlmostEqual(plan.planned_charge_minutes, 15.0, places=3)
         self.assertAlmostEqual(plan.estimated_total_charge_cost, 0.10, places=2)
-        self.assertEqual(plan.selected_interval_count, 1)
+        self.assertEqual(plan.selected_minute_count, 16)
 
     def test_current_interval_charges_when_it_is_cheapest(self) -> None:
         args = make_args()
@@ -87,9 +88,25 @@ class MinimalPlannerTests(unittest.TestCase):
             price("2026-03-21T22:30:00+11:00", "2026-03-21T23:00:00+11:00", 12.0),
         ]
 
-        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args)
+        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args, now=dt("2026-03-21T22:00:00+11:00"))
 
         self.assertEqual(plan.action, "charge")
+
+    def test_current_action_uses_selected_current_minute_not_whole_interval(self) -> None:
+        args = make_args()
+        args.charge_target_soc = 52
+        battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
+        prices = [
+            price("2026-03-21T22:00:00+11:00", "2026-03-21T22:05:00+11:00", 4.0),
+            price("2026-03-21T22:05:00+11:00", "2026-03-21T22:10:00+11:00", 12.0),
+        ]
+
+        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args, now=dt("2026-03-21T22:03:00+11:00"))
+
+        self.assertEqual(plan.action, "charge")
+        self.assertAlmostEqual(plan.planned_charge_minutes, 1.2, places=3)
+        self.assertEqual(plan.selected_minute_count, 2)
+        self.assertEqual(plan.next_charge_at, dt("2026-03-21T22:03:00+11:00"))
 
     def test_excludes_demand_window_intervals(self) -> None:
         args = make_args()
@@ -99,7 +116,7 @@ class MinimalPlannerTests(unittest.TestCase):
             price("2026-03-21T15:30:00+11:00", "2026-03-21T16:00:00+11:00", 12.0),
         ]
 
-        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args)
+        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args, now=dt("2026-03-21T15:00:00+11:00"))
 
         self.assertEqual(plan.steps[0].action, "fallback")
         self.assertEqual(plan.steps[1].action, "charge")
@@ -109,7 +126,6 @@ class MinimalPlannerTests(unittest.TestCase):
             ControlPlanStep(
                 interval_start=dt("2026-03-21T22:00:00+11:00"),
                 interval_end=dt("2026-03-21T22:05:00+11:00"),
-                duration_minutes=5,
                 action="fallback",
                 planned_charge_kwh=0.0,
                 planned_charge_minutes=0.0,
@@ -120,7 +136,6 @@ class MinimalPlannerTests(unittest.TestCase):
             ControlPlanStep(
                 interval_start=dt("2026-03-21T23:00:00+11:00"),
                 interval_end=dt("2026-03-21T23:30:00+11:00"),
-                duration_minutes=30,
                 action="charge",
                 planned_charge_kwh=2.5,
                 planned_charge_minutes=15.0,
@@ -130,11 +145,51 @@ class MinimalPlannerTests(unittest.TestCase):
             ),
         ]
 
-        start, hourly_actions, next_charge_at = build_hourly_plan_preview(steps, hours=4)
+        start, hourly_actions, next_charge_at = build_hourly_plan_preview(
+            steps,
+            (dt("2026-03-21T23:00:00+11:00"),),
+            dt("2026-03-21T23:00:00+11:00"),
+            hours=4,
+        )
 
         self.assertEqual(start, "2026-03-21T22:00:00+11:00")
         self.assertEqual(hourly_actions, [0, 1, 0, 0])
         self.assertEqual(next_charge_at, "2026-03-21T23:00:00+11:00")
+
+    def test_hourly_plan_preview_uses_selected_minutes_not_parent_interval_start(self) -> None:
+        steps = [
+            ControlPlanStep(
+                interval_start=dt("2026-03-22T12:00:01+11:00"),
+                interval_end=dt("2026-03-22T12:30:00+11:00"),
+                action="charge",
+                planned_charge_kwh=0.1693,
+                planned_charge_minutes=1.0,
+                expected_grid_kw=15.0,
+                expected_cost=0.01,
+                projected_soc=40,
+            ),
+            ControlPlanStep(
+                interval_start=dt("2026-03-22T13:00:01+11:00"),
+                interval_end=dt("2026-03-22T13:30:00+11:00"),
+                action="charge",
+                planned_charge_kwh=1.0,
+                planned_charge_minutes=6.0,
+                expected_grid_kw=15.0,
+                expected_cost=0.05,
+                projected_soc=42,
+            ),
+        ]
+
+        start, hourly_actions, next_charge_at = build_hourly_plan_preview(
+            steps,
+            (dt("2026-03-22T13:00:00+11:00"), dt("2026-03-22T13:01:00+11:00")),
+            dt("2026-03-22T13:00:00+11:00"),
+            hours=3,
+        )
+
+        self.assertEqual(start, "2026-03-22T12:00:00+11:00")
+        self.assertEqual(hourly_actions, [0, 1, 0])
+        self.assertEqual(next_charge_at, "2026-03-22T13:00:00+11:00")
 
     def test_charge_slot_allowed_respects_3pm_to_9pm_window(self) -> None:
         self.assertFalse(charge_slot_allowed(dt("2026-03-21T20:45:00+11:00")))

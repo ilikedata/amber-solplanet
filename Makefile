@@ -14,7 +14,7 @@ test:
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
 run:
-	$(PYTHON) $(SCRIPT) --price-source amber --loop --loop-seconds 300 --apply
+	$(PYTHON) $(SCRIPT) --price-source amber --loop --loop-seconds 60 --apply
 
 dry-run:
-	$(PYTHON) $(SCRIPT) --price-source amber --loop --loop-seconds 300
+	$(PYTHON) $(SCRIPT) --price-source amber --loop --loop-seconds 60

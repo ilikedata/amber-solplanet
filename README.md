@@ -74,7 +74,7 @@ Useful planner fields include:
 - `planned_charge_minutes`
 - `estimated_total_charge_cost`
 - `average_planned_charge_price_c_per_kwh`
-- `selected_interval_count`
+- `selected_minute_count`
 - `target_reachable`
 - `plan_hourly_actions`
 - `next_charge_at`
