@@ -1,28 +1,13 @@
 import unittest
-from argparse import Namespace
 from datetime import datetime
 
-from solplanet_price_controller import (
-    AmberPriceSnapshot,
-    BatterySnapshot,
-    ControlPlanStep,
-    build_hourly_plan_preview,
-    build_price_only_charge_plan,
-    charge_slot_allowed,
-)
+from amber import AmberPriceSnapshot
+from planner import BatterySnapshot, ControlPlanStep, build_hourly_plan_preview, build_price_only_charge_plan
+from solplanet import charge_slot_allowed
 
 
 def dt(value: str) -> datetime:
     return datetime.fromisoformat(value)
-
-
-def make_args() -> Namespace:
-    return Namespace(
-        charge_watts=15000,
-        planner_charge_kwh_per_minute=10.0 / 60.0,
-        charge_target_soc=75,
-        battery_capacity_kwh=10.0,
-    )
 
 
 def price(start: str, end: str, cents: float, demand_window: bool = False) -> AmberPriceSnapshot:
@@ -43,14 +28,21 @@ def price(start: str, end: str, cents: float, demand_window: bool = False) -> Am
 
 class MinimalPlannerTests(unittest.TestCase):
     def test_uses_actual_30_min_interval_and_partial_last_interval(self) -> None:
-        args = make_args()
         battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
         prices = [
             price("2026-03-21T21:00:00+11:00", "2026-03-21T21:30:00+11:00", 20.0),
             price("2026-03-21T21:30:00+11:00", "2026-03-21T22:00:00+11:00", 5.0),
         ]
 
-        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args, now=dt("2026-03-21T21:00:00+11:00"))
+        plan = build_price_only_charge_plan(
+            battery=battery,
+            prices=prices,
+            battery_capacity_kwh=10.0,
+            charge_target_soc=75,
+            planner_charge_kwh_per_minute=10.0 / 60.0,
+            charge_watts=15000,
+            now=dt("2026-03-21T21:00:00+11:00"),
+        )
 
         self.assertEqual(plan.action, "fallback")
         self.assertAlmostEqual(plan.required_energy_kwh, 2.5, places=3)
@@ -63,7 +55,6 @@ class MinimalPlannerTests(unittest.TestCase):
         self.assertEqual(plan.next_charge_at, dt("2026-03-21T21:30:00+11:00"))
 
     def test_mixed_5_and_30_min_intervals_are_handled_consistently(self) -> None:
-        args = make_args()
         battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
         prices = [
             price("2026-03-21T22:00:00+11:00", "2026-03-21T22:05:00+11:00", 25.0),
@@ -71,7 +62,15 @@ class MinimalPlannerTests(unittest.TestCase):
             price("2026-03-22T12:00:00+11:00", "2026-03-22T12:30:00+11:00", 4.0),
         ]
 
-        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args, now=dt("2026-03-21T22:00:00+11:00"))
+        plan = build_price_only_charge_plan(
+            battery=battery,
+            prices=prices,
+            battery_capacity_kwh=10.0,
+            charge_target_soc=75,
+            planner_charge_kwh_per_minute=10.0 / 60.0,
+            charge_watts=15000,
+            now=dt("2026-03-21T22:00:00+11:00"),
+        )
 
         self.assertEqual(plan.action, "fallback")
         self.assertAlmostEqual(plan.required_energy_kwh, 2.5, places=3)
@@ -81,27 +80,40 @@ class MinimalPlannerTests(unittest.TestCase):
         self.assertEqual(plan.selected_minute_count, 16)
 
     def test_current_interval_charges_when_it_is_cheapest(self) -> None:
-        args = make_args()
         battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
         prices = [
             price("2026-03-21T22:00:00+11:00", "2026-03-21T22:30:00+11:00", 4.0),
             price("2026-03-21T22:30:00+11:00", "2026-03-21T23:00:00+11:00", 12.0),
         ]
 
-        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args, now=dt("2026-03-21T22:00:00+11:00"))
+        plan = build_price_only_charge_plan(
+            battery=battery,
+            prices=prices,
+            battery_capacity_kwh=10.0,
+            charge_target_soc=75,
+            planner_charge_kwh_per_minute=10.0 / 60.0,
+            charge_watts=15000,
+            now=dt("2026-03-21T22:00:00+11:00"),
+        )
 
         self.assertEqual(plan.action, "charge")
 
     def test_current_action_uses_selected_current_minute_not_whole_interval(self) -> None:
-        args = make_args()
-        args.charge_target_soc = 52
         battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
         prices = [
             price("2026-03-21T22:00:00+11:00", "2026-03-21T22:05:00+11:00", 4.0),
             price("2026-03-21T22:05:00+11:00", "2026-03-21T22:10:00+11:00", 12.0),
         ]
 
-        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args, now=dt("2026-03-21T22:03:00+11:00"))
+        plan = build_price_only_charge_plan(
+            battery=battery,
+            prices=prices,
+            battery_capacity_kwh=10.0,
+            charge_target_soc=52,
+            planner_charge_kwh_per_minute=10.0 / 60.0,
+            charge_watts=15000,
+            now=dt("2026-03-21T22:03:00+11:00"),
+        )
 
         self.assertEqual(plan.action, "charge")
         self.assertAlmostEqual(plan.planned_charge_minutes, 1.2, places=3)
@@ -109,14 +121,21 @@ class MinimalPlannerTests(unittest.TestCase):
         self.assertEqual(plan.next_charge_at, dt("2026-03-21T22:03:00+11:00"))
 
     def test_excludes_demand_window_intervals(self) -> None:
-        args = make_args()
         battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
         prices = [
             price("2026-03-21T15:00:00+11:00", "2026-03-21T15:30:00+11:00", 1.0, demand_window=True),
             price("2026-03-21T15:30:00+11:00", "2026-03-21T16:00:00+11:00", 12.0),
         ]
 
-        plan = build_price_only_charge_plan(battery=battery, prices=prices, args=args, now=dt("2026-03-21T15:00:00+11:00"))
+        plan = build_price_only_charge_plan(
+            battery=battery,
+            prices=prices,
+            battery_capacity_kwh=10.0,
+            charge_target_soc=75,
+            planner_charge_kwh_per_minute=10.0 / 60.0,
+            charge_watts=15000,
+            now=dt("2026-03-21T15:00:00+11:00"),
+        )
 
         self.assertEqual(plan.steps[0].action, "fallback")
         self.assertEqual(plan.steps[1].action, "charge")
