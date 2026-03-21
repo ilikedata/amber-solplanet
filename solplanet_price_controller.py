@@ -35,8 +35,8 @@ DEFAULT_REQUEST_RETRIES = 2
 DEFAULT_RETRY_DELAY_SECONDS = 2.0
 DEFAULT_LOG_FILE = "solplanet_price_controller.ndjson"
 DEFAULT_PLANNER_HORIZON_HOURS = 24
-DEFAULT_PLANNER_INTERVAL_MINUTES = 5
 DEFAULT_BATTERY_CAPACITY_KWH = 50.0
+AMBER_REQUEST_RESOLUTION_MINUTES = 5
 DEMAND_WINDOW_START_HOUR = 15
 DEMAND_WINDOW_END_HOUR = 21
 BATTERY_DEVICE = 4
@@ -124,7 +124,6 @@ class ControlPlan:
     selected_minute_count: int
     target_reachable: bool
     next_charge_at: datetime | None
-    planner_summary: str
 
 
 class InverterUnavailableError(RuntimeError):
@@ -342,13 +341,16 @@ class AmberClient:
                     raise RuntimeError(f"Amber API error: {exc}") from exc
         raise RuntimeError(f"Amber API error: {last_exc}")
 
-    def get_price_horizon(self, site_id: str, interval_minutes: int, horizon_intervals: int) -> list[AmberPriceSnapshot]:
+    def get_price_horizon(self, site_id: str, horizon_hours: int) -> list[AmberPriceSnapshot]:
+        horizon_minutes = max(1, horizon_hours * 60)
+        request_intervals = max(1, (horizon_minutes + AMBER_REQUEST_RESOLUTION_MINUTES - 1) // AMBER_REQUEST_RESOLUTION_MINUTES)
+        horizon_end = floor_to_minute(datetime.now().astimezone()) + timedelta(minutes=horizon_minutes)
         intervals = self._with_api(
             lambda api: api.get_current_prices(
                 site_id,
                 previous=0,
-                next=max(horizon_intervals - 1, 0),
-                resolution=interval_minutes,
+                next=max(request_intervals - 1, 0),
+                resolution=AMBER_REQUEST_RESOLUTION_MINUTES,
             )
         )
         grouped: dict[datetime, dict[str, Any]] = {}
@@ -381,7 +383,7 @@ class AmberClient:
                     demand_window=demand_window,
                 )
             )
-        return prices[:horizon_intervals]
+        return [price for price in prices if floor_to_minute(price.start_time) < horizon_end]
 
 
 def load_battery_snapshot(client: SolplanetClient, battery_sn: str) -> BatterySnapshot:
@@ -411,9 +413,9 @@ def log_battery_snapshot(snapshot: BatterySnapshot) -> None:
 
 def build_manual_price_horizon(args: argparse.Namespace) -> list[AmberPriceSnapshot]:
     now = datetime.now().astimezone().replace(second=0, microsecond=0)
-    interval_delta = timedelta(minutes=args.planner_interval_minutes)
+    interval_delta = timedelta(minutes=1)
     prices: list[AmberPriceSnapshot] = []
-    interval_count = max(1, (args.planner_horizon_hours * 60) // args.planner_interval_minutes)
+    interval_count = max(1, args.planner_horizon_hours * 60)
     for index in range(interval_count):
         start_time = now + (index * interval_delta)
         end_time = start_time + interval_delta
@@ -422,7 +424,7 @@ def build_manual_price_horizon(args: argparse.Namespace) -> list[AmberPriceSnaps
                 site_id="manual",
                 start_time=start_time,
                 end_time=end_time,
-                duration_minutes=args.planner_interval_minutes,
+                duration_minutes=1,
                 general_per_kwh=args.general_per_kwh,
                 general_descriptor="manual",
                 feed_in_per_kwh=None,
@@ -538,10 +540,6 @@ def build_price_only_charge_plan(
         selected_minute_count=len(selected_minute_buckets),
         target_reachable=total_planned_charge_kwh + 1e-6 >= required_energy_kwh,
         next_charge_at=next_charge_at,
-        planner_summary=(
-            f"price_only selected {current_minute_action} required_energy_kwh={required_energy_kwh:.3f} "
-            f"planned_charge_kwh={total_planned_charge_kwh:.3f}"
-        ),
     )
 
 
@@ -596,8 +594,8 @@ def apply_state(
         {
             "action": action,
             "description": description,
-            "mode_response": schedule_response.get("dat"),
-            "schedule_response": mode_response.get("dat"),
+            "schedule_response": schedule_response.get("dat"),
+            "mode_response": mode_response.get("dat"),
             "confirmed_mod_r": confirmed_mode.get("mod_r"),
             "confirmed_pin": confirmed_schedule.get("Pin"),
             "confirmed_pout": confirmed_schedule.get("Pout"),
@@ -619,8 +617,7 @@ def run_once(args: argparse.Namespace) -> None:
             amber_client = AmberClient(api_key=amber_api_key)
             prices = amber_client.get_price_horizon(
                 site_id=args.amber_site_id,
-                interval_minutes=args.planner_interval_minutes,
-                horizon_intervals=max(1, (args.planner_horizon_hours * 60) // args.planner_interval_minutes),
+                horizon_hours=args.planner_horizon_hours,
             )
             source = "amber_price_plan"
         else:
@@ -722,13 +719,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--charge-target-soc", type=int, default=DEFAULT_CHARGE_TARGET_SOC)
     parser.add_argument("--battery-capacity-kwh", type=float, default=DEFAULT_BATTERY_CAPACITY_KWH)
     parser.add_argument("--planner-horizon-hours", type=int, default=DEFAULT_PLANNER_HORIZON_HOURS)
-    parser.add_argument(
-        "--planner-interval-minutes",
-        type=int,
-        default=DEFAULT_PLANNER_INTERVAL_MINUTES,
-        choices=[5, 15, 30],
-        help="Amber forecast resolution to request.",
-    )
     parser.add_argument("--amber-site-id", default=env_or_default("AMBER_SITE_ID", DEFAULT_AMBER_SITE_ID))
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--loop", action="store_true")
