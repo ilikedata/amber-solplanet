@@ -1,0 +1,10 @@
+{
+  "type": 1,
+  "mod_r": 2,
+  "sn": "BATTERY123",
+  "discharge_max": 15000,
+  "charge_max": 15000,
+  "muf": 0,
+  "mod": 2,
+  "num": 1
+}

@@ -1,0 +1,56 @@
+[
+  {
+    "channel_type": "general",
+    "start_time": "2026-03-21T22:00:01+11:00",
+    "end_time": "2026-03-21T22:05:00+11:00",
+    "duration": 5,
+    "per_kwh": 15.18685,
+    "descriptor": "veryLow",
+    "demand_window": false
+  },
+  {
+    "channel_type": "feedIn",
+    "start_time": "2026-03-21T22:00:01+11:00",
+    "end_time": "2026-03-21T22:05:00+11:00",
+    "duration": 5,
+    "per_kwh": -8.08603,
+    "descriptor": "high",
+    "demand_window": false
+  },
+  {
+    "channel_type": "general",
+    "start_time": "2026-03-21T22:05:01+11:00",
+    "end_time": "2026-03-21T22:10:00+11:00",
+    "duration": 5,
+    "per_kwh": 14.33843,
+    "descriptor": "veryLow",
+    "demand_window": false
+  },
+  {
+    "channel_type": "general",
+    "start_time": "2026-03-21T22:10:01+11:00",
+    "end_time": "2026-03-21T22:15:00+11:00",
+    "duration": 5,
+    "per_kwh": 14.60738,
+    "descriptor": "veryLow",
+    "demand_window": true
+  },
+  {
+    "channel_type": "feedIn",
+    "start_time": "2026-03-22T12:00:01+11:00",
+    "end_time": "2026-03-22T12:30:00+11:00",
+    "duration": 30,
+    "per_kwh": -0.25,
+    "descriptor": "neutral",
+    "demand_window": false
+  },
+  {
+    "channel_type": "general",
+    "start_time": "2026-03-22T12:00:01+11:00",
+    "end_time": "2026-03-22T12:30:00+11:00",
+    "duration": 30,
+    "per_kwh": 4.57388,
+    "descriptor": "extremelyLow",
+    "demand_window": false
+  }
+]
