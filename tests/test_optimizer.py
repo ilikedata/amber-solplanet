@@ -120,6 +120,25 @@ class MinimalPlannerTests(unittest.TestCase):
         self.assertEqual(plan.selected_minute_count, 2)
         self.assertEqual(plan.next_charge_at, dt("2026-03-21T22:03:00+11:00"))
 
+    def test_next_charge_at_uses_earliest_selected_time_not_cheapest_bucket_time(self) -> None:
+        battery = BatterySnapshot(soc=20, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
+        prices = [
+            price("2026-03-22T11:00:00+11:00", "2026-03-22T12:00:00+11:00", 6.0),
+            price("2026-03-22T13:30:00+11:00", "2026-03-22T14:30:00+11:00", 4.0),
+        ]
+
+        plan = build_price_only_charge_plan(
+            battery=battery,
+            prices=prices,
+            battery_capacity_kwh=10.0,
+            charge_target_soc=55,
+            planner_charge_kwh_per_minute=0.05,
+            charge_watts=15000,
+            now=dt("2026-03-22T10:00:00+11:00"),
+        )
+
+        self.assertEqual(plan.next_charge_at, dt("2026-03-22T11:00:00+11:00"))
+
     def test_excludes_demand_window_intervals(self) -> None:
         battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
         prices = [

@@ -99,7 +99,6 @@ def build_price_only_charge_plan(
     selected_energy_by_end: dict[datetime, float] = {}
     selected_minutes_by_end: dict[datetime, float] = {}
     selected_minute_buckets: set[datetime] = set()
-    next_charge_at: datetime | None = None
     remaining_energy_kwh = required_energy_kwh
     for minute_bucket in sorted(minute_buckets, key=lambda item: (item.general_per_kwh, item.minute_start)):
         if remaining_energy_kwh <= 0:
@@ -112,8 +111,6 @@ def build_price_only_charge_plan(
             selected_kwh / planner_charge_kwh_per_minute
         )
         selected_minute_buckets.add(minute_bucket.minute_start)
-        if next_charge_at is None:
-            next_charge_at = minute_bucket.minute_start
         remaining_energy_kwh -= selected_kwh
 
     steps: list[ControlPlanStep] = []
@@ -149,10 +146,12 @@ def build_price_only_charge_plan(
     if total_planned_charge_kwh > 0:
         average_price_c_per_kwh = (total_cost / total_planned_charge_kwh) * 100.0
 
+    sorted_selected_minutes = tuple(sorted(selected_minute_buckets))
+
     return ControlPlan(
         action="charge" if now in selected_minute_buckets else "fallback",
         steps=steps,
-        selected_minute_starts=tuple(sorted(selected_minute_buckets)),
+        selected_minute_starts=sorted_selected_minutes,
         required_energy_kwh=round(required_energy_kwh, 4),
         required_charge_minutes=round(required_charge_minutes, 4),
         planned_charge_kwh=round(total_planned_charge_kwh, 4),
@@ -161,7 +160,7 @@ def build_price_only_charge_plan(
         average_planned_charge_price_c_per_kwh=round(average_price_c_per_kwh, 3),
         selected_minute_count=len(selected_minute_buckets),
         target_reachable=total_planned_charge_kwh + 1e-6 >= required_energy_kwh,
-        next_charge_at=next_charge_at,
+        next_charge_at=None if not sorted_selected_minutes else sorted_selected_minutes[0],
     )
 
 
