@@ -31,6 +31,7 @@ class MinuteBucket:
     parent_end_time: datetime
     minute_start: datetime
     general_per_kwh: float
+    effective_per_kwh: float
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class ControlPlan:
     planned_charge_minutes: float
     estimated_total_charge_cost: float
     average_planned_charge_price_c_per_kwh: float
+    average_planned_effective_price_c_per_kwh: float
     selected_minute_count: int
     target_reachable: bool
     next_charge_at: datetime | None
@@ -57,6 +59,58 @@ def cents_per_kwh_to_dollars(cents: float) -> float:
     return cents / 100.0
 
 
+def compute_lateness_penalty_c_per_kwh(
+    minute_start: datetime,
+    lateness_penalty_start_hour: int,
+    max_lateness_penalty_c_per_kwh: float,
+    demand_window_start_hour: int = 15,
+) -> float:
+    if max_lateness_penalty_c_per_kwh <= 0:
+        return 0.0
+    penalty_start = minute_start.replace(
+        hour=lateness_penalty_start_hour,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    demand_start = minute_start.replace(
+        hour=demand_window_start_hour,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if minute_start <= penalty_start:
+        return 0.0
+    if minute_start >= demand_start:
+        return max_lateness_penalty_c_per_kwh
+    ramp_minutes = (demand_start - penalty_start).total_seconds() / 60.0
+    if ramp_minutes <= 0:
+        return max_lateness_penalty_c_per_kwh
+    elapsed_minutes = (minute_start - penalty_start).total_seconds() / 60.0
+    return max_lateness_penalty_c_per_kwh * (elapsed_minutes / ramp_minutes)
+
+
+def compute_forecast_uncertainty_penalty_c_per_kwh(
+    minute_start: datetime,
+    now: datetime,
+    forecast_risk_horizon_hours: int,
+    max_forecast_risk_penalty_c_per_kwh: float,
+) -> float:
+    if max_forecast_risk_penalty_c_per_kwh <= 0:
+        return 0.0
+    if forecast_risk_horizon_hours <= 0:
+        return max_forecast_risk_penalty_c_per_kwh
+    minute_start = floor_to_minute(minute_start)
+    now = floor_to_minute(now)
+    if minute_start <= now:
+        return 0.0
+    horizon_minutes = forecast_risk_horizon_hours * 60
+    minutes_ahead = (minute_start - now).total_seconds() / 60.0
+    if minutes_ahead >= horizon_minutes:
+        return max_forecast_risk_penalty_c_per_kwh
+    return max_forecast_risk_penalty_c_per_kwh * (minutes_ahead / horizon_minutes)
+
+
 def build_price_only_charge_plan(
     battery: BatterySnapshot,
     prices: list[AmberPriceSnapshot],
@@ -64,6 +118,10 @@ def build_price_only_charge_plan(
     charge_target_soc: int,
     planner_charge_kwh_per_minute: float,
     charge_watts: int,
+    lateness_penalty_start_hour: int = 13,
+    max_lateness_penalty_c_per_kwh: float = 1.5,
+    forecast_risk_horizon_hours: int = 6,
+    max_forecast_risk_penalty_c_per_kwh: float = 1.0,
     now: datetime | None = None,
 ) -> ControlPlan:
     if not prices:
@@ -92,6 +150,18 @@ def build_price_only_charge_plan(
                     parent_end_time=price.end_time,
                     minute_start=minute_start,
                     general_per_kwh=price.general_per_kwh,
+                    effective_per_kwh=price.general_per_kwh
+                    + compute_forecast_uncertainty_penalty_c_per_kwh(
+                        minute_start,
+                        now=now,
+                        forecast_risk_horizon_hours=forecast_risk_horizon_hours,
+                        max_forecast_risk_penalty_c_per_kwh=max_forecast_risk_penalty_c_per_kwh,
+                    )
+                    + compute_lateness_penalty_c_per_kwh(
+                        minute_start,
+                        lateness_penalty_start_hour=lateness_penalty_start_hour,
+                        max_lateness_penalty_c_per_kwh=max_lateness_penalty_c_per_kwh,
+                    ),
                 )
             )
             minute_start += timedelta(minutes=1)
@@ -99,8 +169,9 @@ def build_price_only_charge_plan(
     selected_energy_by_end: dict[datetime, float] = {}
     selected_minutes_by_end: dict[datetime, float] = {}
     selected_minute_buckets: set[datetime] = set()
+    total_effective_cost = 0.0
     remaining_energy_kwh = required_energy_kwh
-    for minute_bucket in sorted(minute_buckets, key=lambda item: (item.general_per_kwh, item.minute_start)):
+    for minute_bucket in sorted(minute_buckets, key=lambda item: (item.effective_per_kwh, item.minute_start)):
         if remaining_energy_kwh <= 0:
             break
         selected_kwh = min(planner_charge_kwh_per_minute, remaining_energy_kwh)
@@ -111,6 +182,7 @@ def build_price_only_charge_plan(
             selected_kwh / planner_charge_kwh_per_minute
         )
         selected_minute_buckets.add(minute_bucket.minute_start)
+        total_effective_cost += selected_kwh * cents_per_kwh_to_dollars(minute_bucket.effective_per_kwh)
         remaining_energy_kwh -= selected_kwh
 
     steps: list[ControlPlanStep] = []
@@ -143,8 +215,10 @@ def build_price_only_charge_plan(
         )
 
     average_price_c_per_kwh = 0.0
+    average_effective_price_c_per_kwh = 0.0
     if total_planned_charge_kwh > 0:
         average_price_c_per_kwh = (total_cost / total_planned_charge_kwh) * 100.0
+        average_effective_price_c_per_kwh = (total_effective_cost / total_planned_charge_kwh) * 100.0
 
     sorted_selected_minutes = tuple(sorted(selected_minute_buckets))
 
@@ -158,6 +232,7 @@ def build_price_only_charge_plan(
         planned_charge_minutes=round(total_planned_charge_minutes, 4),
         estimated_total_charge_cost=round(total_cost, 2),
         average_planned_charge_price_c_per_kwh=round(average_price_c_per_kwh, 3),
+        average_planned_effective_price_c_per_kwh=round(average_effective_price_c_per_kwh, 3),
         selected_minute_count=len(selected_minute_buckets),
         target_reachable=total_planned_charge_kwh + 1e-6 >= required_energy_kwh,
         next_charge_at=None if not sorted_selected_minutes else sorted_selected_minutes[0],

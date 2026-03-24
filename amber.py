@@ -24,6 +24,18 @@ class AmberPriceSnapshot:
     feed_in_per_kwh: float | None
     feed_in_descriptor: str | None
     demand_window: bool
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "site_id": self.site_id,
+            "start_time": self.start_time.isoformat(),
+            "end_time": self.end_time.isoformat(),
+            "duration_minutes": self.duration_minutes,
+            "general_per_kwh": self.general_per_kwh,
+            "general_descriptor": self.general_descriptor,
+            "feed_in_per_kwh": self.feed_in_per_kwh,
+            "feed_in_descriptor": self.feed_in_descriptor,
+            "demand_window": self.demand_window,
+        }
 
 
 def floor_to_minute(value: datetime) -> datetime:

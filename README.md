@@ -30,6 +30,8 @@ It uses:
 
 - Amber forecast prices only
 - a 1-minute internal planning grid derived from the Amber forecast
+- a soft lateness premium to avoid over-reliance on the final cheap minutes before the demand window
+- a soft forecast-horizon premium to avoid over-trusting cheap prices far into the future
 - battery capacity
 - a normalized planner charge rate in `kWh/min`
 - hard demand-window exclusion for charging
@@ -58,7 +60,11 @@ Useful CLI tuning knobs:
 - `--planner-horizon-hours` default `24`
 - `--charge-watts` default `15000`
 - `--planner-charge-kwh-per-minute` default `0.1693`
-- `--charge-target-soc` default `97`
+- `--charge-target-soc` default `95`
+- `--lateness-penalty-start-hour` default `13`
+- `--max-lateness-penalty-c-per-kwh` default `1.5`
+- `--forecast-risk-horizon-hours` default `6`
+- `--max-forecast-risk-penalty-c-per-kwh` default `1.0`
 
 `--charge-watts` is the inverter command used during charging. `--planner-charge-kwh-per-minute` is the battery fill rate used for energy and cost planning.
 
@@ -74,6 +80,7 @@ Useful planner fields include:
 - `planned_charge_minutes`
 - `estimated_total_charge_cost`
 - `average_planned_charge_price_c_per_kwh`
+- `average_planned_effective_price_c_per_kwh`
 - `selected_minute_count`
 - `target_reachable`
 - `plan_hourly_actions`

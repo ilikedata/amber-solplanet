@@ -24,11 +24,16 @@ def make_args(price_source: str = "manual") -> Namespace:
         charge_target_soc=97,
         battery_capacity_kwh=50.0,
         planner_horizon_hours=24,
+        lateness_penalty_start_hour=13,
+        max_lateness_penalty_c_per_kwh=1.5,
+        forecast_risk_horizon_hours=6,
+        max_forecast_risk_penalty_c_per_kwh=1.0,
         amber_site_id="site",
         apply=False,
         loop=False,
         loop_seconds=60,
         log_file="test.ndjson",
+        amber_forecast_log=None,
     )
 
 
@@ -81,6 +86,7 @@ def plan(action: str = "fallback") -> ControlPlan:
         planned_charge_minutes=171.0,
         estimated_total_charge_cost=1.4,
         average_planned_charge_price_c_per_kwh=4.836,
+        average_planned_effective_price_c_per_kwh=5.1,
         selected_minute_count=172,
         target_reachable=True,
         next_charge_at=dt("2026-03-22T13:00:00+11:00"),
@@ -164,6 +170,27 @@ class RunOnceTests(unittest.TestCase):
         self.assertEqual(events[1][0], "planner_fallback")
         self.assertEqual(events[1][1]["fallback_action"], "fallback")
         self.assertEqual(apply_state.call_args.kwargs["action"], "fallback")
+
+    def test_run_once_amber_logs_forecast_when_enabled(self) -> None:
+        args = make_args("amber")
+        args.amber_forecast_log = "test_forecast.ndjson"
+        events: list[tuple[str, dict]] = []
+        battery = BatterySnapshot(soc=39, battery_power_watts=785, battery_voltage_raw=5200, battery_current_raw=151)
+        prices = [price("2026-03-21T20:45:00+11:00", "2026-03-21T20:50:00+11:00", 5.0, -8.0)]
+
+        with patch.object(controller, "log_json", side_effect=lambda label, payload: events.append((label, payload))):
+            with patch.object(controller, "log_amber_forecast") as log_forecast:
+                with patch.object(controller, "env_or_default", return_value="token"):
+                    with patch.object(controller, "AmberClient") as amber_client_cls:
+                        amber_client_cls.return_value.get_price_horizon.return_value = prices
+                        with patch.object(controller, "SolplanetClient", return_value=object()):
+                            with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                                with patch.object(controller, "build_price_only_charge_plan", return_value=plan("fallback")):
+                                    with patch.object(controller, "build_hourly_plan_preview", return_value=("2026-03-21T20:00:00+11:00", [0] * 24, "2026-03-22T13:00:00+11:00")):
+                                        with patch.object(controller, "apply_state"):
+                                            controller.run_once(args)
+
+        log_forecast.assert_called_once_with("test_forecast.ndjson", prices)
 
 
 if __name__ == "__main__":

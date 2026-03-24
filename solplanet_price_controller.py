@@ -24,14 +24,19 @@ DEFAULT_BATTERY_SN = ""
 DEFAULT_CHARGE_WATTS = 15000
 DEFAULT_PLANNER_CHARGE_KWH_PER_MINUTE = 10.158 / 60.0
 DEFAULT_DISCHARGE_WATTS = 1500
-DEFAULT_CHARGE_TARGET_SOC = 97
+DEFAULT_CHARGE_TARGET_SOC = 95
 DEFAULT_PRICE_SOURCE = "manual"
 DEFAULT_AMBER_SITE_ID = ""
 DEFAULT_AMBER_API_KEY = ""
 DEFAULT_LOOP_SECONDS = 60
 DEFAULT_LOG_FILE = "solplanet_price_controller.ndjson"
+DEFAULT_AMBER_FORECAST_LOG = "amber_forecast.ndjson"
 DEFAULT_PLANNER_HORIZON_HOURS = 24
 DEFAULT_BATTERY_CAPACITY_KWH = 50.0
+DEFAULT_LATENESS_PENALTY_START_HOUR = 13
+DEFAULT_MAX_LATENESS_PENALTY_C_PER_KWH = 1.5
+DEFAULT_FORECAST_RISK_HORIZON_HOURS = 6
+DEFAULT_MAX_FORECAST_RISK_PENALTY_C_PER_KWH = 1.0
 
 
 LOG_FILE_PATH: Path | None = None
@@ -72,6 +77,20 @@ def log_json(label: str, payload: dict[str, Any]) -> None:
     print(line)
 
 
+def log_amber_forecast(log_file: str, prices: list[AmberPriceSnapshot]) -> None:
+    path = Path(log_file).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    record = {
+        "ts": datetime.now().astimezone().isoformat(),
+        "event": "amber_forecast_fetch",
+        "prices": [p.to_dict() for p in prices],
+    }
+    line = json.dumps(record, sort_keys=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+
 def run_once(args: argparse.Namespace) -> None:
     client = SolplanetClient(host=args.host)
     battery = load_battery_snapshot(client, args.battery_sn)
@@ -93,6 +112,8 @@ def run_once(args: argparse.Namespace) -> None:
                 raise PlannerUnavailableError("AMBER_API_KEY is not configured")
             amber_client = AmberClient(api_key=amber_api_key)
             prices = amber_client.get_price_horizon(site_id=args.amber_site_id, horizon_hours=args.planner_horizon_hours)
+            if args.amber_forecast_log:
+                log_amber_forecast(args.amber_forecast_log, prices)
             source = "amber_price_plan"
         else:
             prices = build_manual_price_horizon(horizon_hours=args.planner_horizon_hours, general_per_kwh=args.general_per_kwh)
@@ -105,6 +126,10 @@ def run_once(args: argparse.Namespace) -> None:
             charge_target_soc=args.charge_target_soc,
             planner_charge_kwh_per_minute=args.planner_charge_kwh_per_minute,
             charge_watts=args.charge_watts,
+            lateness_penalty_start_hour=args.lateness_penalty_start_hour,
+            max_lateness_penalty_c_per_kwh=args.max_lateness_penalty_c_per_kwh,
+            forecast_risk_horizon_hours=args.forecast_risk_horizon_hours,
+            max_forecast_risk_penalty_c_per_kwh=args.max_forecast_risk_penalty_c_per_kwh,
             now=now,
         )
         current_interval = prices[0]
@@ -148,6 +173,7 @@ def run_once(args: argparse.Namespace) -> None:
                 "estimated_total_charge_minutes": plan.planned_charge_minutes,
                 "estimated_total_charge_cost": plan.estimated_total_charge_cost,
                 "average_planned_charge_price_c_per_kwh": plan.average_planned_charge_price_c_per_kwh,
+                "average_planned_effective_price_c_per_kwh": plan.average_planned_effective_price_c_per_kwh,
                 "selected_minute_count": plan.selected_minute_count,
                 "target_reachable": plan.target_reachable,
             },
@@ -202,11 +228,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--charge-target-soc", type=int, default=DEFAULT_CHARGE_TARGET_SOC)
     parser.add_argument("--battery-capacity-kwh", type=float, default=DEFAULT_BATTERY_CAPACITY_KWH)
     parser.add_argument("--planner-horizon-hours", type=int, default=DEFAULT_PLANNER_HORIZON_HOURS)
+    parser.add_argument("--lateness-penalty-start-hour", type=int, default=DEFAULT_LATENESS_PENALTY_START_HOUR)
+    parser.add_argument("--max-lateness-penalty-c-per-kwh", type=float, default=DEFAULT_MAX_LATENESS_PENALTY_C_PER_KWH)
+    parser.add_argument("--forecast-risk-horizon-hours", type=int, default=DEFAULT_FORECAST_RISK_HORIZON_HOURS)
+    parser.add_argument("--max-forecast-risk-penalty-c-per-kwh", type=float, default=DEFAULT_MAX_FORECAST_RISK_PENALTY_C_PER_KWH)
     parser.add_argument("--amber-site-id", default=env_or_default("AMBER_SITE_ID", DEFAULT_AMBER_SITE_ID))
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--loop-seconds", type=int, default=DEFAULT_LOOP_SECONDS)
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE)
+    parser.add_argument("--amber-forecast-log", default=env_or_default("AMBER_FORECAST_LOG", DEFAULT_AMBER_FORECAST_LOG))
     return parser.parse_args(argv)
 
 
