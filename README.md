@@ -4,7 +4,7 @@
 
 This repository contains a small local controller for **Solplanet battery/inverter systems** on **Amber Electric** pricing.
 
-It plans **grid charging only** from the Amber forecast at the **lowest forecast cost**, while excluding the daily demand window.
+It plans **grid charging** from the Amber forecast at the **lowest forecast cost**, while excluding the daily demand window, and can optionally force **battery discharge for export** when the feed-in price is high and cheap non-demand-window recharge time is available later.
 
 ## What The Controller Does
 
@@ -17,7 +17,7 @@ On each loop, the controller:
 5. expands the Amber forecast into 1-minute planning buckets
 6. selects the cheapest non-demand-window minutes until that energy is covered
 7. allows a **partial final minute** for the last bit of required energy
-8. decides whether the current minute should `charge` or `fallback`
+8. decides whether the current minute should `charge`, `discharge`, or `fallback`
 9. applies only the current short-lived action using the local Solplanet control API
 
 The fallback action is **self-consumption mode**.
@@ -65,8 +65,15 @@ Useful CLI tuning knobs:
 - `--max-lateness-penalty-c-per-kwh` default `1.5`
 - `--forecast-risk-horizon-hours` default `6`
 - `--max-forecast-risk-penalty-c-per-kwh` default `1.0`
+- `--discharge-min-soc` default `55`
+- `--discharge-feed-in-threshold-c-per-kwh` default `18.0`
+- `--discharge-cheap-lookahead-hours` default `24`
+- `--discharge-cheap-price-threshold-c-per-kwh` default `10.0`
+- `--discharge-required-cheap-hours` default `4.0`
 
 `--charge-watts` is the inverter command used during charging. `--planner-charge-kwh-per-minute` is the battery fill rate used for energy and cost planning.
+
+The discharge override only counts cheap future recharge minutes where `general_per_kwh` is below the configured threshold and the interval is **not** in a demand window.
 
 ## Logging
 
