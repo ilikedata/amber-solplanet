@@ -6,6 +6,9 @@ from datetime import datetime, timedelta
 from amber import AmberPriceSnapshot, floor_to_minute
 
 
+DEMAND_WINDOW_START_HOUR = 15
+
+
 @dataclass(frozen=True)
 class BatterySnapshot:
     soc: int
@@ -57,6 +60,19 @@ class PlannerUnavailableError(RuntimeError):
 
 def cents_per_kwh_to_dollars(cents: float) -> float:
     return cents / 100.0
+
+
+def next_demand_window_start(now: datetime, demand_window_start_hour: int = DEMAND_WINDOW_START_HOUR) -> datetime:
+    now = floor_to_minute(now)
+    demand_start = now.replace(
+        hour=demand_window_start_hour,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if now >= demand_start:
+        demand_start += timedelta(days=1)
+    return demand_start
 
 
 def compute_lateness_penalty_c_per_kwh(
@@ -132,18 +148,23 @@ def build_price_only_charge_plan(
         raise PlannerUnavailableError("Planner charge kWh per minute must be positive")
 
     now = floor_to_minute(now or datetime.now().astimezone())
+    planning_end = next_demand_window_start(now)
     current_energy_kwh = (battery.soc / 100.0) * battery_capacity_kwh
     target_energy_kwh = (charge_target_soc / 100.0) * battery_capacity_kwh
     required_energy_kwh = max(0.0, target_energy_kwh - current_energy_kwh)
     required_charge_minutes = required_energy_kwh / planner_charge_kwh_per_minute if required_energy_kwh > 0 else 0.0
 
+    plan_prices: list[tuple[AmberPriceSnapshot, datetime, datetime]] = []
     minute_buckets: list[MinuteBucket] = []
     for price in prices:
+        interval_start = max(floor_to_minute(price.start_time), now)
+        interval_end = min(floor_to_minute(price.end_time), planning_end)
+        if interval_start >= interval_end:
+            continue
+        plan_prices.append((price, interval_start, interval_end))
         if price.demand_window:
             continue
-        interval_end = floor_to_minute(price.end_time)
-        interval_start = interval_end - timedelta(minutes=price.duration_minutes)
-        minute_start = max(interval_start, now)
+        minute_start = interval_start
         while minute_start < interval_end:
             minute_buckets.append(
                 MinuteBucket(
@@ -165,6 +186,9 @@ def build_price_only_charge_plan(
                 )
             )
             minute_start += timedelta(minutes=1)
+
+    if not plan_prices:
+        raise PlannerUnavailableError("No forecast intervals available before the next demand window")
 
     selected_energy_by_end: dict[datetime, float] = {}
     selected_minutes_by_end: dict[datetime, float] = {}
@@ -190,7 +214,7 @@ def build_price_only_charge_plan(
     total_planned_charge_kwh = 0.0
     total_planned_charge_minutes = 0.0
     total_cost = 0.0
-    for price in prices:
+    for price, interval_start, interval_end in plan_prices:
         selected_kwh = selected_energy_by_end.get(price.end_time, 0.0)
         selected_minutes = selected_minutes_by_end.get(price.end_time, 0.0)
         action = "charge" if selected_kwh > 0 else "fallback"
@@ -203,8 +227,8 @@ def build_price_only_charge_plan(
         total_cost += expected_cost
         steps.append(
             ControlPlanStep(
-                interval_start=price.start_time,
-                interval_end=price.end_time,
+                interval_start=interval_start,
+                interval_end=interval_end,
                 action=action,
                 planned_charge_kwh=round(selected_kwh, 4),
                 planned_charge_minutes=round(selected_minutes, 4),

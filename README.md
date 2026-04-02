@@ -4,7 +4,7 @@
 
 This repository contains a small local controller for **Solplanet battery/inverter systems** on **Amber Electric** pricing.
 
-It plans **grid charging** from the Amber forecast at the **lowest forecast cost**, while excluding the daily demand window, and can optionally force **battery discharge for export** when the feed-in price is high and cheap non-demand-window recharge time is available later.
+It plans **grid charging** from the Amber forecast at the **lowest forecast cost**, while excluding the daily demand window and only planning through the next **3pm demand-window start**, and can optionally force **battery discharge for export** when the feed-in price is high and cheap non-demand-window recharge time is available later.
 
 ## What The Controller Does
 
@@ -30,6 +30,7 @@ It uses:
 
 - Amber forecast prices only
 - a 1-minute internal planning grid derived from the Amber forecast
+- a planning horizon capped at the next 3pm demand-window boundary
 - a soft lateness premium to avoid over-reliance on the final cheap minutes before the demand window
 - a soft forecast-horizon premium to avoid over-trusting cheap prices far into the future
 - battery capacity
@@ -73,7 +74,7 @@ Useful CLI tuning knobs:
 
 `--charge-watts` is the inverter command used during charging. `--planner-charge-kwh-per-minute` is the battery fill rate used for energy and cost planning.
 
-The discharge override only counts cheap future recharge minutes where `general_per_kwh` is below the configured threshold and the interval is **not** in a demand window.
+The discharge override only counts cheap future recharge minutes where `general_per_kwh` is below the configured threshold, the interval is **not** in a demand window, and the minute still falls before the next 3pm demand-window start.
 
 ## Logging
 

@@ -287,6 +287,34 @@ class RunOnceTests(unittest.TestCase):
         self.assertEqual(events[1][1]["final_action"], "fallback")
         self.assertEqual(apply_state.call_args.kwargs["action"], "fallback")
 
+    def test_run_once_does_not_count_cheap_minutes_after_next_demand_window_start(self) -> None:
+        args = make_args("amber")
+        events: list[tuple[str, dict]] = []
+        now = dt("2026-03-25T17:00:00+11:00")
+        battery = BatterySnapshot(soc=70, battery_power_watts=0, battery_voltage_raw=5200, battery_current_raw=0)
+        prices = [
+            price("2026-03-25T17:00:00+11:00", "2026-03-25T17:05:00+11:00", 30.0, -19.0, demand_window=True),
+            price("2026-03-26T15:30:00+11:00", "2026-03-26T19:30:00+11:00", 8.0),
+        ]
+
+        with patch("solplanet_price_controller.datetime") as mock_dt:
+            mock_dt.now.return_value.astimezone.return_value = now
+            with patch.object(controller, "log_json", side_effect=lambda label, payload: events.append((label, payload))):
+                with patch.object(controller, "env_or_default", return_value="token"):
+                    with patch.object(controller, "AmberClient") as amber_client_cls:
+                        amber_client_cls.return_value.get_price_horizon.return_value = prices
+                        with patch.object(controller, "SolplanetClient", return_value=object()):
+                            with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                                with patch.object(controller, "build_price_only_charge_plan", return_value=plan("fallback")):
+                                    with patch.object(controller, "build_hourly_plan_preview", return_value=("2026-03-25T17:00:00+11:00", [0] * 24, None)):
+                                        with patch.object(controller, "apply_state") as apply_state:
+                                            controller.run_once(args)
+
+        self.assertFalse(events[1][1]["discharge_rule_matched"])
+        self.assertEqual(events[1][1]["cheap_charge_minutes_in_lookahead"], 0)
+        self.assertEqual(events[1][1]["final_action"], "fallback")
+        self.assertEqual(apply_state.call_args.kwargs["action"], "fallback")
+
 
 if __name__ == "__main__":
     unittest.main()

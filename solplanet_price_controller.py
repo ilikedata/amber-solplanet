@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from amber import AmberClient, AmberPriceSnapshot, build_manual_price_horizon, floor_to_minute
-from planner import PlannerUnavailableError, build_hourly_plan_preview, build_price_only_charge_plan
+from planner import PlannerUnavailableError, build_hourly_plan_preview, build_price_only_charge_plan, next_demand_window_start
 from solplanet import InverterUnavailableError, InverterWriteError, SolplanetClient, apply_state, charge_slot_allowed, load_battery_snapshot
 
 
@@ -111,7 +111,7 @@ def cheap_charge_minutes_within_window(
     if lookahead_hours <= 0:
         return 0
     window_start = floor_to_minute(now)
-    window_end = window_start + timedelta(hours=lookahead_hours)
+    window_end = min(window_start + timedelta(hours=lookahead_hours), next_demand_window_start(window_start))
     cheap_minutes = 0
     for price in prices:
         if price.demand_window or price.general_per_kwh >= cheap_price_threshold_c_per_kwh:

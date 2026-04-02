@@ -9,6 +9,7 @@ from planner import (
     build_price_only_charge_plan,
     compute_forecast_uncertainty_penalty_c_per_kwh,
     compute_lateness_penalty_c_per_kwh,
+    next_demand_window_start,
 )
 from solplanet import charge_slot_allowed
 
@@ -34,6 +35,16 @@ def price(start: str, end: str, cents: float, demand_window: bool = False) -> Am
 
 
 class MinimalPlannerTests(unittest.TestCase):
+    def test_next_demand_window_start_uses_next_3pm_boundary(self) -> None:
+        self.assertEqual(
+            next_demand_window_start(dt("2026-03-22T10:00:00+11:00")),
+            dt("2026-03-22T15:00:00+11:00"),
+        )
+        self.assertEqual(
+            next_demand_window_start(dt("2026-03-22T15:00:00+11:00")),
+            dt("2026-03-23T15:00:00+11:00"),
+        )
+
     def test_forecast_uncertainty_penalty_ramps_with_time_ahead(self) -> None:
         now = dt("2026-03-22T10:00:00+11:00")
         self.assertEqual(
@@ -247,6 +258,57 @@ class MinimalPlannerTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.next_charge_at, dt("2026-03-22T11:30:00+11:00"))
+
+    def test_plan_ignores_intervals_after_today_demand_window_start(self) -> None:
+        battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
+        prices = [
+            price("2026-03-22T10:30:00+11:00", "2026-03-22T10:40:00+11:00", 7.0),
+            price("2026-03-22T15:30:00+11:00", "2026-03-22T15:40:00+11:00", 1.0),
+        ]
+
+        plan = build_price_only_charge_plan(
+            battery=battery,
+            prices=prices,
+            battery_capacity_kwh=10.0,
+            charge_target_soc=55,
+            planner_charge_kwh_per_minute=0.05,
+            charge_watts=15000,
+            now=dt("2026-03-22T10:00:00+11:00"),
+        )
+
+        self.assertEqual(plan.next_charge_at, dt("2026-03-22T10:30:00+11:00"))
+        self.assertEqual([step.interval_start for step in plan.steps], [dt("2026-03-22T10:30:00+11:00")])
+
+    def test_plan_rolls_cutoff_to_tomorrow_after_3pm(self) -> None:
+        battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
+        prices = [
+            price("2026-03-22T21:00:00+11:00", "2026-03-22T21:10:00+11:00", 9.0),
+            price("2026-03-23T14:00:00+11:00", "2026-03-23T14:10:00+11:00", 2.0),
+            price("2026-03-23T15:30:00+11:00", "2026-03-23T15:40:00+11:00", 1.0),
+        ]
+
+        plan = build_price_only_charge_plan(
+            battery=battery,
+            prices=prices,
+            battery_capacity_kwh=10.0,
+            charge_target_soc=55,
+            planner_charge_kwh_per_minute=0.05,
+            charge_watts=15000,
+            lateness_penalty_start_hour=15,
+            max_lateness_penalty_c_per_kwh=0.0,
+            forecast_risk_horizon_hours=24,
+            max_forecast_risk_penalty_c_per_kwh=0.0,
+            now=dt("2026-03-22T17:00:00+11:00"),
+        )
+
+        self.assertEqual(
+            [step.interval_start for step in plan.steps],
+            [
+                dt("2026-03-22T21:00:00+11:00"),
+                dt("2026-03-23T14:00:00+11:00"),
+            ],
+        )
+        self.assertTrue(all(step.interval_end <= dt("2026-03-23T15:00:00+11:00") for step in plan.steps))
 
     def test_excludes_demand_window_intervals(self) -> None:
         battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
