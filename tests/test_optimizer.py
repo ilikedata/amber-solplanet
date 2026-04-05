@@ -102,7 +102,7 @@ class MinimalPlannerTests(unittest.TestCase):
         self.assertAlmostEqual(plan.planned_charge_minutes, 15.0, places=3)
         self.assertAlmostEqual(plan.estimated_total_charge_cost, 0.12, places=2)
         self.assertAlmostEqual(plan.average_planned_charge_price_c_per_kwh, 5.0, places=3)
-        self.assertEqual(plan.selected_minute_count, 16)
+        self.assertEqual(plan.selected_minute_count, 15)
         self.assertEqual(plan.next_charge_at, dt("2026-03-21T21:30:00+11:00"))
 
     def test_mixed_5_and_30_min_intervals_are_handled_consistently(self) -> None:
@@ -128,7 +128,7 @@ class MinimalPlannerTests(unittest.TestCase):
         self.assertAlmostEqual(plan.planned_charge_kwh, 2.5, places=3)
         self.assertAlmostEqual(plan.planned_charge_minutes, 15.0, places=3)
         self.assertAlmostEqual(plan.estimated_total_charge_cost, 0.10, places=2)
-        self.assertEqual(plan.selected_minute_count, 16)
+        self.assertEqual(plan.selected_minute_count, 15)
 
     def test_current_interval_charges_when_it_is_cheapest(self) -> None:
         battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
@@ -259,6 +259,82 @@ class MinimalPlannerTests(unittest.TestCase):
 
         self.assertEqual(plan.next_charge_at, dt("2026-03-22T11:30:00+11:00"))
 
+    def test_plan_uses_earliest_eligible_minutes_first(self) -> None:
+        battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
+        prices = [
+            price("2026-03-22T06:00:00+11:00", "2026-03-22T07:00:00+11:00", 6.2),
+            price("2026-03-22T12:00:00+11:00", "2026-03-22T13:00:00+11:00", 6.1),
+            price("2026-03-22T14:00:00+11:00", "2026-03-22T15:00:00+11:00", 6.0),
+        ]
+
+        plan = build_price_only_charge_plan(
+            battery=battery,
+            prices=prices,
+            battery_capacity_kwh=10.0,
+            charge_target_soc=80,
+            planner_charge_kwh_per_minute=0.05,
+            charge_watts=15000,
+            lateness_penalty_start_hour=15,
+            max_lateness_penalty_c_per_kwh=0.0,
+            forecast_risk_horizon_hours=24,
+            max_forecast_risk_penalty_c_per_kwh=0.0,
+            now=dt("2026-03-22T06:00:00+11:00"),
+        )
+
+        self.assertEqual(plan.next_charge_at, dt("2026-03-22T06:00:00+11:00"))
+        self.assertEqual([step.planned_charge_minutes for step in plan.steps], [60.0, 0.0, 0.0])
+        self.assertEqual(plan.selected_minute_count, 60)
+
+    def test_price_cap_blocks_minutes_above_cap(self) -> None:
+        battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
+        prices = [
+            price("2026-03-22T09:00:00+11:00", "2026-03-22T09:10:00+11:00", 11.5),
+            price("2026-03-22T10:00:00+11:00", "2026-03-22T10:30:00+11:00", 12.5),
+        ]
+
+        plan = build_price_only_charge_plan(
+            battery=battery,
+            prices=prices,
+            battery_capacity_kwh=10.0,
+            charge_target_soc=60,
+            planner_charge_kwh_per_minute=0.05,
+            charge_watts=15000,
+            lateness_penalty_start_hour=15,
+            max_lateness_penalty_c_per_kwh=0.0,
+            forecast_risk_horizon_hours=24,
+            max_forecast_risk_penalty_c_per_kwh=0.0,
+            max_charge_price_c_per_kwh=12.0,
+            now=dt("2026-03-22T09:00:00+11:00"),
+        )
+
+        self.assertFalse(plan.target_reachable)
+        self.assertEqual(plan.planned_charge_minutes, 10.0)
+        self.assertEqual([step.action for step in plan.steps], ["charge", "fallback"])
+
+    def test_11_cent_cap_applies_only_after_1pm(self) -> None:
+        battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
+        prices = [
+            price("2026-03-22T12:30:00+11:00", "2026-03-22T12:40:00+11:00", 11.0),
+            price("2026-03-22T13:30:00+11:00", "2026-03-22T13:40:00+11:00", 11.0),
+        ]
+
+        plan = build_price_only_charge_plan(
+            battery=battery,
+            prices=prices,
+            battery_capacity_kwh=10.0,
+            charge_target_soc=55,
+            planner_charge_kwh_per_minute=0.05,
+            charge_watts=15000,
+            lateness_penalty_start_hour=15,
+            max_lateness_penalty_c_per_kwh=0.0,
+            forecast_risk_horizon_hours=24,
+            max_forecast_risk_penalty_c_per_kwh=0.0,
+            now=dt("2026-03-22T12:00:00+11:00"),
+        )
+
+        self.assertEqual([step.action for step in plan.steps], ["fallback", "charge"])
+        self.assertEqual(plan.next_charge_at, dt("2026-03-22T13:30:00+11:00"))
+
     def test_plan_ignores_intervals_after_today_demand_window_start(self) -> None:
         battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
         prices = [
@@ -314,7 +390,7 @@ class MinimalPlannerTests(unittest.TestCase):
         battery = BatterySnapshot(soc=50, battery_power_watts=0, battery_voltage_raw=0, battery_current_raw=0)
         prices = [
             price("2026-03-21T15:00:00+11:00", "2026-03-21T15:30:00+11:00", 1.0, demand_window=True),
-            price("2026-03-21T15:30:00+11:00", "2026-03-21T16:00:00+11:00", 12.0),
+            price("2026-03-21T15:30:00+11:00", "2026-03-21T16:00:00+11:00", 10.0),
         ]
 
         plan = build_price_only_charge_plan(

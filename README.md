@@ -4,7 +4,7 @@
 
 This repository contains a small local controller for **Solplanet battery/inverter systems** on **Amber Electric** pricing.
 
-It plans **grid charging** from the Amber forecast at the **lowest forecast cost**, while excluding the daily demand window and only planning through the next **3pm demand-window start**, and can optionally force **battery discharge for export** when the feed-in price is high and cheap non-demand-window recharge time is available later.
+It makes a direct **grid charging** decision from the current Amber price while excluding the daily demand window: charge at `10c` or less, or at `11c` or less after `1pm`, and optionally force **battery discharge for export** when the feed-in price is high and cheap non-demand-window recharge time is available later.
 
 ## What The Controller Does
 
@@ -14,28 +14,22 @@ On each loop, the controller:
 2. fetches the Amber forecast horizon
 3. calculates required battery energy to reach the target SOC
 4. converts the planner charge rate into **kWh per minute**
-5. expands the Amber forecast into 1-minute planning buckets
-6. selects the cheapest non-demand-window minutes until that energy is covered
-7. allows a **partial final minute** for the last bit of required energy
-8. decides whether the current minute should `charge`, `discharge`, or `fallback`
-9. applies only the current short-lived action using the local Solplanet control API
+5. reads the current price interval
+6. decides whether the current minute should `charge`, `discharge`, or `fallback`
+7. applies only the current short-lived action using the local Solplanet control API
 
 The fallback action is **self-consumption mode**.
 
 ## Control Approach
 
-The planner is intentionally minimal.
+The controller is intentionally minimal.
 
 It uses:
 
-- Amber forecast prices only
-- a 1-minute internal planning grid derived from the Amber forecast
-- a planning horizon capped at the next 3pm demand-window boundary
-- a soft lateness premium to avoid over-reliance on the final cheap minutes before the demand window
-- a soft forecast-horizon premium to avoid over-trusting cheap prices far into the future
-- battery capacity
-- a normalized planner charge rate in `kWh/min`
+- the current Amber price interval for charge decisions
+- a time-based charge price cap: `10c` before `1pm`, `11c` from `1pm` until the next demand-window start
 - hard demand-window exclusion for charging
+- Amber lookahead only for the discharge override
 
 It does **not** use:
 
@@ -66,6 +60,7 @@ Useful CLI tuning knobs:
 - `--max-lateness-penalty-c-per-kwh` default `1.5`
 - `--forecast-risk-horizon-hours` default `6`
 - `--max-forecast-risk-penalty-c-per-kwh` default `1.0`
+- `--max-charge-price-c-per-kwh` default `10.0`
 - `--discharge-min-soc` default `55`
 - `--discharge-feed-in-threshold-c-per-kwh` default `18.0`
 - `--discharge-cheap-lookahead-hours` default `24`

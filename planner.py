@@ -7,6 +7,10 @@ from amber import AmberPriceSnapshot, floor_to_minute
 
 
 DEMAND_WINDOW_START_HOUR = 15
+AFTERNOON_CHARGE_CAP_START_HOUR = 13
+DEFAULT_MAX_CHARGE_PRICE_C_PER_KWH = 10.0
+DEFAULT_AFTERNOON_MAX_CHARGE_PRICE_C_PER_KWH = 11.0
+ENERGY_EPSILON_KWH = 1e-9
 
 
 @dataclass(frozen=True)
@@ -127,6 +131,17 @@ def compute_forecast_uncertainty_penalty_c_per_kwh(
     return max_forecast_risk_penalty_c_per_kwh * (minutes_ahead / horizon_minutes)
 
 
+def max_charge_price_for_minute(
+    minute_start: datetime,
+    base_max_charge_price_c_per_kwh: float,
+    afternoon_max_charge_price_c_per_kwh: float = DEFAULT_AFTERNOON_MAX_CHARGE_PRICE_C_PER_KWH,
+    afternoon_charge_cap_start_hour: int = AFTERNOON_CHARGE_CAP_START_HOUR,
+) -> float:
+    if minute_start.hour >= afternoon_charge_cap_start_hour:
+        return max(base_max_charge_price_c_per_kwh, afternoon_max_charge_price_c_per_kwh)
+    return base_max_charge_price_c_per_kwh
+
+
 def build_price_only_charge_plan(
     battery: BatterySnapshot,
     prices: list[AmberPriceSnapshot],
@@ -138,6 +153,7 @@ def build_price_only_charge_plan(
     max_lateness_penalty_c_per_kwh: float = 1.5,
     forecast_risk_horizon_hours: int = 6,
     max_forecast_risk_penalty_c_per_kwh: float = 1.0,
+    max_charge_price_c_per_kwh: float = DEFAULT_MAX_CHARGE_PRICE_C_PER_KWH,
     now: datetime | None = None,
 ) -> ControlPlan:
     if not prices:
@@ -152,6 +168,8 @@ def build_price_only_charge_plan(
     current_energy_kwh = (battery.soc / 100.0) * battery_capacity_kwh
     target_energy_kwh = (charge_target_soc / 100.0) * battery_capacity_kwh
     required_energy_kwh = max(0.0, target_energy_kwh - current_energy_kwh)
+    if required_energy_kwh <= ENERGY_EPSILON_KWH:
+        required_energy_kwh = 0.0
     required_charge_minutes = required_energy_kwh / planner_charge_kwh_per_minute if required_energy_kwh > 0 else 0.0
 
     plan_prices: list[tuple[AmberPriceSnapshot, datetime, datetime]] = []
@@ -166,6 +184,12 @@ def build_price_only_charge_plan(
             continue
         minute_start = interval_start
         while minute_start < interval_end:
+            if price.general_per_kwh > max_charge_price_for_minute(
+                minute_start,
+                base_max_charge_price_c_per_kwh=max_charge_price_c_per_kwh,
+            ):
+                minute_start += timedelta(minutes=1)
+                continue
             minute_buckets.append(
                 MinuteBucket(
                     parent_end_time=price.end_time,
@@ -195,19 +219,20 @@ def build_price_only_charge_plan(
     selected_minute_buckets: set[datetime] = set()
     total_effective_cost = 0.0
     remaining_energy_kwh = required_energy_kwh
-    for minute_bucket in sorted(minute_buckets, key=lambda item: (item.effective_per_kwh, item.minute_start)):
-        if remaining_energy_kwh <= 0:
+    for minute_bucket in sorted(minute_buckets, key=lambda item: item.minute_start):
+        if remaining_energy_kwh <= ENERGY_EPSILON_KWH:
             break
         selected_kwh = min(planner_charge_kwh_per_minute, remaining_energy_kwh)
-        if selected_kwh <= 0:
+        if selected_kwh <= ENERGY_EPSILON_KWH:
             continue
         selected_energy_by_end[minute_bucket.parent_end_time] = selected_energy_by_end.get(minute_bucket.parent_end_time, 0.0) + selected_kwh
-        selected_minutes_by_end[minute_bucket.parent_end_time] = selected_minutes_by_end.get(minute_bucket.parent_end_time, 0.0) + (
-            selected_kwh / planner_charge_kwh_per_minute
-        )
+        selected_minutes_by_end[minute_bucket.parent_end_time] = selected_minutes_by_end.get(
+            minute_bucket.parent_end_time,
+            0.0,
+        ) + (selected_kwh / planner_charge_kwh_per_minute)
         selected_minute_buckets.add(minute_bucket.minute_start)
         total_effective_cost += selected_kwh * cents_per_kwh_to_dollars(minute_bucket.effective_per_kwh)
-        remaining_energy_kwh -= selected_kwh
+        remaining_energy_kwh = max(0.0, remaining_energy_kwh - selected_kwh)
 
     steps: list[ControlPlanStep] = []
     projected_energy_kwh = current_energy_kwh

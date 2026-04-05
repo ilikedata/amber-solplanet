@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from amber import AmberClient, AmberPriceSnapshot, build_manual_price_horizon, floor_to_minute
-from planner import PlannerUnavailableError, build_hourly_plan_preview, build_price_only_charge_plan, next_demand_window_start
+from planner import PlannerUnavailableError, next_demand_window_start
 from solplanet import InverterUnavailableError, InverterWriteError, SolplanetClient, apply_state, charge_slot_allowed, load_battery_snapshot
 
 
@@ -24,7 +24,7 @@ DEFAULT_BATTERY_SN = ""
 DEFAULT_CHARGE_WATTS = 15000
 DEFAULT_PLANNER_CHARGE_KWH_PER_MINUTE = 10.158 / 60.0
 DEFAULT_DISCHARGE_WATTS = 15000
-DEFAULT_CHARGE_TARGET_SOC = 99
+DEFAULT_CHARGE_TARGET_SOC = 98
 DEFAULT_PRICE_SOURCE = "manual"
 DEFAULT_AMBER_SITE_ID = ""
 DEFAULT_AMBER_API_KEY = ""
@@ -37,6 +37,9 @@ DEFAULT_LATENESS_PENALTY_START_HOUR = 13
 DEFAULT_MAX_LATENESS_PENALTY_C_PER_KWH = 1.5
 DEFAULT_FORECAST_RISK_HORIZON_HOURS = 6
 DEFAULT_MAX_FORECAST_RISK_PENALTY_C_PER_KWH = 1.0
+DEFAULT_MAX_CHARGE_PRICE_C_PER_KWH = 10.0
+DEFAULT_AFTERNOON_MAX_CHARGE_PRICE_C_PER_KWH = 11.0
+AFTERNOON_CHARGE_CAP_START_HOUR = 13
 DEFAULT_DISCHARGE_MIN_SOC = 55
 DEFAULT_DISCHARGE_FEED_IN_THRESHOLD_C_PER_KWH = 17.0
 DEFAULT_DISCHARGE_CHEAP_LOOKAHEAD_HOURS = 24
@@ -114,7 +117,7 @@ def cheap_charge_minutes_within_window(
     window_end = min(window_start + timedelta(hours=lookahead_hours), next_demand_window_start(window_start))
     cheap_minutes = 0
     for price in prices:
-        if price.demand_window or price.general_per_kwh >= cheap_price_threshold_c_per_kwh:
+        if price.demand_window or price.general_per_kwh > cheap_price_threshold_c_per_kwh:
             continue
         interval_start = max(floor_to_minute(price.start_time), window_start)
         interval_end = min(floor_to_minute(price.end_time), window_end)
@@ -152,6 +155,23 @@ def should_discharge_now(
     return True, feed_in_credit, cheap_minutes
 
 
+def should_charge_now(
+    current_interval: AmberPriceSnapshot,
+    now: datetime,
+    base_max_charge_price_c_per_kwh: float,
+    afternoon_max_charge_price_c_per_kwh: float = DEFAULT_AFTERNOON_MAX_CHARGE_PRICE_C_PER_KWH,
+    afternoon_charge_cap_start_hour: int = AFTERNOON_CHARGE_CAP_START_HOUR,
+) -> bool:
+    if current_interval.demand_window:
+        return False
+    current_price = current_interval.general_per_kwh
+    if current_price <= base_max_charge_price_c_per_kwh:
+        return True
+    if now.hour >= afternoon_charge_cap_start_hour and current_price <= afternoon_max_charge_price_c_per_kwh:
+        return True
+    return False
+
+
 def run_once(args: argparse.Namespace) -> None:
     client = SolplanetClient(host=args.host)
     battery = load_battery_snapshot(client, args.battery_sn)
@@ -180,21 +200,12 @@ def run_once(args: argparse.Namespace) -> None:
             prices = build_manual_price_horizon(horizon_hours=args.planner_horizon_hours, general_per_kwh=args.general_per_kwh)
             source = "manual_price_plan"
 
-        plan = build_price_only_charge_plan(
-            battery=battery,
-            prices=prices,
-            battery_capacity_kwh=args.battery_capacity_kwh,
-            charge_target_soc=args.charge_target_soc,
-            planner_charge_kwh_per_minute=args.planner_charge_kwh_per_minute,
-            charge_watts=args.charge_watts,
-            lateness_penalty_start_hour=args.lateness_penalty_start_hour,
-            max_lateness_penalty_c_per_kwh=args.max_lateness_penalty_c_per_kwh,
-            forecast_risk_horizon_hours=args.forecast_risk_horizon_hours,
-            max_forecast_risk_penalty_c_per_kwh=args.max_forecast_risk_penalty_c_per_kwh,
-            now=now,
-        )
         current_interval = prices[0]
-        derived_action = plan.action
+        derived_action = "charge" if should_charge_now(
+            current_interval=current_interval,
+            now=now,
+            base_max_charge_price_c_per_kwh=args.max_charge_price_c_per_kwh,
+        ) else "fallback"
         final_action = derived_action
         discharge_rule_matched, normalized_feed_in_credit, cheap_charge_minutes = should_discharge_now(
             args=args,
@@ -204,21 +215,11 @@ def run_once(args: argparse.Namespace) -> None:
             now=now,
         )
 
-        # Low-price charge rule: 6am-2:55pm, < 10c, < 90% SOC
-        is_in_charge_window = (6 <= now.hour < 14) or (now.hour == 14 and now.minute < 55)
-        if is_in_charge_window and current_interval.general_per_kwh < 10.0 and battery.soc < 90:
-            final_action = "charge"
-        elif discharge_rule_matched:
+        if discharge_rule_matched:
             final_action = "discharge"
 
         if final_action == "charge" and not charge_slot_allowed(now):
             final_action = "fallback"
-
-        plan_hourly_start, plan_hourly_actions, next_charge_at = build_hourly_plan_preview(
-            plan.steps,
-            plan.selected_minute_starts,
-            plan.next_charge_at,
-        )
 
         log_json(
             "decision",
@@ -228,9 +229,7 @@ def run_once(args: argparse.Namespace) -> None:
                 "forecast_general_per_kwh": current_interval.general_per_kwh,
                 "forecast_feed_in_per_kwh": current_interval.feed_in_per_kwh,
                 "normalized_feed_in_credit_c_per_kwh": normalized_feed_in_credit,
-                "planner_charge_kwh_per_minute": round(args.planner_charge_kwh_per_minute, 6),
                 "command_charge_watts": args.charge_watts,
-                "projected_soc": plan.steps[0].projected_soc,
                 "discharge_rule_matched": discharge_rule_matched,
                 "cheap_charge_minutes_in_lookahead": cheap_charge_minutes,
                 "derived_action": derived_action,
@@ -242,19 +241,8 @@ def run_once(args: argparse.Namespace) -> None:
             {
                 "source": source,
                 "current_action": final_action,
-                "feasible_plan_through": plan.steps[-1].interval_end.isoformat(),
-                "plan_hourly_start": plan_hourly_start,
-                "plan_hourly_actions": plan_hourly_actions,
-                "next_charge_at": next_charge_at,
-                "required_energy_kwh": plan.required_energy_kwh,
-                "required_charge_minutes": plan.required_charge_minutes,
-                "estimated_total_charge_kwh": plan.planned_charge_kwh,
-                "estimated_total_charge_minutes": plan.planned_charge_minutes,
-                "estimated_total_charge_cost": plan.estimated_total_charge_cost,
-                "average_planned_charge_price_c_per_kwh": plan.average_planned_charge_price_c_per_kwh,
-                "average_planned_effective_price_c_per_kwh": plan.average_planned_effective_price_c_per_kwh,
-                "selected_minute_count": plan.selected_minute_count,
-                "target_reachable": plan.target_reachable,
+                "feasible_plan_through": current_interval.end_time.isoformat(),
+                "next_charge_at": current_interval.start_time.isoformat() if derived_action == "charge" else None,
             },
         )
         action = final_action
@@ -311,6 +299,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-lateness-penalty-c-per-kwh", type=float, default=DEFAULT_MAX_LATENESS_PENALTY_C_PER_KWH)
     parser.add_argument("--forecast-risk-horizon-hours", type=int, default=DEFAULT_FORECAST_RISK_HORIZON_HOURS)
     parser.add_argument("--max-forecast-risk-penalty-c-per-kwh", type=float, default=DEFAULT_MAX_FORECAST_RISK_PENALTY_C_PER_KWH)
+    parser.add_argument("--max-charge-price-c-per-kwh", type=float, default=DEFAULT_MAX_CHARGE_PRICE_C_PER_KWH)
     parser.add_argument("--discharge-min-soc", type=int, default=DEFAULT_DISCHARGE_MIN_SOC)
     parser.add_argument(
         "--discharge-feed-in-threshold-c-per-kwh",
