@@ -14,7 +14,14 @@ from typing import Any
 
 from amber import AmberClient, AmberPriceSnapshot, build_manual_price_horizon, floor_to_minute
 from planner import PlannerUnavailableError, next_demand_window_start
-from solplanet import InverterUnavailableError, InverterWriteError, SolplanetClient, apply_state, charge_slot_allowed, load_battery_snapshot
+from solplanet import (
+    InverterUnavailableError,
+    InverterWriteError,
+    SolplanetClient,
+    apply_state,
+    charge_slot_allowed,
+    load_battery_snapshot_with_telemetry,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -24,7 +31,7 @@ DEFAULT_BATTERY_SN = ""
 DEFAULT_CHARGE_WATTS = 15000
 DEFAULT_PLANNER_CHARGE_KWH_PER_MINUTE = 10.158 / 60.0
 DEFAULT_DISCHARGE_WATTS = 15000
-DEFAULT_CHARGE_TARGET_SOC = 98
+DEFAULT_CHARGE_TARGET_SOC = 97
 DEFAULT_PRICE_SOURCE = "manual"
 DEFAULT_AMBER_SITE_ID = ""
 DEFAULT_AMBER_API_KEY = ""
@@ -39,9 +46,9 @@ DEFAULT_FORECAST_RISK_HORIZON_HOURS = 6
 DEFAULT_MAX_FORECAST_RISK_PENALTY_C_PER_KWH = 1.0
 DEFAULT_MAX_CHARGE_PRICE_C_PER_KWH = 10.0
 DEFAULT_AFTERNOON_MAX_CHARGE_PRICE_C_PER_KWH = 11.0
-AFTERNOON_CHARGE_CAP_START_HOUR = 13
+DEFAULT_REDUCED_CHARGE_WATTS = 0
 DEFAULT_DISCHARGE_MIN_SOC = 55
-DEFAULT_DISCHARGE_FEED_IN_THRESHOLD_C_PER_KWH = 17.0
+DEFAULT_DISCHARGE_FEED_IN_THRESHOLD_C_PER_KWH = 16.0
 DEFAULT_DISCHARGE_CHEAP_LOOKAHEAD_HOURS = 24
 DEFAULT_DISCHARGE_CHEAP_PRICE_THRESHOLD_C_PER_KWH = 10.0
 DEFAULT_DISCHARGE_REQUIRED_CHEAP_HOURS = 4.0
@@ -155,26 +162,28 @@ def should_discharge_now(
     return True, feed_in_credit, cheap_minutes
 
 
-def should_charge_now(
+def desired_charge_watts(
     current_interval: AmberPriceSnapshot,
-    now: datetime,
+    battery_soc: int,
+    charge_target_soc: int,
+    max_charge_watts: int,
     base_max_charge_price_c_per_kwh: float,
     afternoon_max_charge_price_c_per_kwh: float = DEFAULT_AFTERNOON_MAX_CHARGE_PRICE_C_PER_KWH,
-    afternoon_charge_cap_start_hour: int = AFTERNOON_CHARGE_CAP_START_HOUR,
-) -> bool:
-    if current_interval.demand_window:
-        return False
+    reduced_charge_watts: int = DEFAULT_REDUCED_CHARGE_WATTS,
+) -> int:
+    if current_interval.demand_window or battery_soc >= charge_target_soc:
+        return 0
     current_price = current_interval.general_per_kwh
     if current_price <= base_max_charge_price_c_per_kwh:
-        return True
-    if now.hour >= afternoon_charge_cap_start_hour and current_price <= afternoon_max_charge_price_c_per_kwh:
-        return True
-    return False
+        return max_charge_watts
+    if current_price <= afternoon_max_charge_price_c_per_kwh:
+        return min(reduced_charge_watts, max_charge_watts)
+    return 0
 
 
 def run_once(args: argparse.Namespace) -> None:
     client = SolplanetClient(host=args.host)
-    battery = load_battery_snapshot(client, args.battery_sn)
+    battery, telemetry = load_battery_snapshot_with_telemetry(client, args.battery_sn)
     log_json(
         "battery_state",
         {
@@ -182,6 +191,7 @@ def run_once(args: argparse.Namespace) -> None:
             "battery_power_watts": battery.battery_power_watts,
             "battery_voltage_raw": battery.battery_voltage_raw,
             "battery_current_raw": battery.battery_current_raw,
+            "inverter_telemetry": telemetry,
         },
     )
     now = datetime.now().astimezone()
@@ -201,11 +211,14 @@ def run_once(args: argparse.Namespace) -> None:
             source = "manual_price_plan"
 
         current_interval = prices[0]
-        derived_action = "charge" if should_charge_now(
+        desired_charge_power = desired_charge_watts(
             current_interval=current_interval,
-            now=now,
+            battery_soc=battery.soc,
+            charge_target_soc=args.charge_target_soc,
+            max_charge_watts=args.charge_watts,
             base_max_charge_price_c_per_kwh=args.max_charge_price_c_per_kwh,
-        ) else "fallback"
+        )
+        derived_action = "charge" if desired_charge_power > 0 else "fallback"
         final_action = derived_action
         discharge_rule_matched, normalized_feed_in_credit, cheap_charge_minutes = should_discharge_now(
             args=args,
@@ -220,6 +233,7 @@ def run_once(args: argparse.Namespace) -> None:
 
         if final_action == "charge" and not charge_slot_allowed(now):
             final_action = "fallback"
+        command_charge_watts = desired_charge_power if final_action == "charge" else args.charge_watts
 
         log_json(
             "decision",
@@ -229,7 +243,7 @@ def run_once(args: argparse.Namespace) -> None:
                 "forecast_general_per_kwh": current_interval.general_per_kwh,
                 "forecast_feed_in_per_kwh": current_interval.feed_in_per_kwh,
                 "normalized_feed_in_credit_c_per_kwh": normalized_feed_in_credit,
-                "command_charge_watts": args.charge_watts,
+                "command_charge_watts": command_charge_watts,
                 "discharge_rule_matched": discharge_rule_matched,
                 "cheap_charge_minutes_in_lookahead": cheap_charge_minutes,
                 "derived_action": derived_action,
@@ -261,7 +275,7 @@ def run_once(args: argparse.Namespace) -> None:
         client=client,
         battery_sn=args.battery_sn,
         action=action,
-        charge_watts=args.charge_watts,
+        charge_watts=command_charge_watts if action == "charge" else args.charge_watts,
         discharge_watts=args.discharge_watts,
         apply=args.apply,
         log_event=log_json,

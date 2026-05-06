@@ -198,6 +198,25 @@ def load_battery_snapshot(client: SolplanetClient, battery_sn: str) -> BatterySn
         raise InverterUnavailableError(f"Failed to read battery telemetry: {exc}") from exc
 
 
+def load_battery_snapshot_with_telemetry(
+    client: SolplanetClient,
+    battery_sn: str,
+) -> tuple[BatterySnapshot, dict[str, Any]]:
+    try:
+        battery_data = client.get_json(f"getdevdata.cgi?device=4&sn={battery_sn}")
+        return (
+            BatterySnapshot(
+                soc=int(battery_data["soc"]),
+                battery_power_watts=int(battery_data.get("pb", 0)),
+                battery_voltage_raw=int(battery_data.get("vb", 0)),
+                battery_current_raw=int(battery_data.get("cb", 0)),
+            ),
+            battery_data,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise InverterUnavailableError(f"Failed to read battery telemetry: {exc}") from exc
+
+
 def apply_state(
     client: SolplanetClient,
     battery_sn: str,

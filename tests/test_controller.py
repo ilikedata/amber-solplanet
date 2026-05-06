@@ -72,12 +72,17 @@ class RunOnceTests(unittest.TestCase):
 
         with patch.object(controller, "log_json", side_effect=lambda label, payload: events.append((label, payload))):
             with patch.object(controller, "SolplanetClient", return_value=object()):
-                with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                with patch.object(
+                    controller,
+                    "load_battery_snapshot_with_telemetry",
+                    return_value=(battery, {"soc": 39, "pb": 785, "vb": 5200, "cb": 151, "pload": -1200}),
+                ):
                     with patch.object(controller, "build_manual_price_horizon", return_value=prices):
                         with patch.object(controller, "apply_state") as apply_state:
                             controller.run_once(args)
 
         self.assertEqual([label for label, _ in events[:3]], ["battery_state", "decision", "plan_preview"])
+        self.assertEqual(events[0][1]["inverter_telemetry"]["pload"], -1200)
         self.assertEqual(events[1][1]["final_action"], "fallback")
         self.assertIsNone(events[2][1]["next_charge_at"])
         apply_state.assert_called_once()
@@ -94,7 +99,7 @@ class RunOnceTests(unittest.TestCase):
                 with patch.object(controller, "AmberClient") as amber_client_cls:
                     amber_client_cls.return_value.get_price_horizon.return_value = prices
                     with patch.object(controller, "SolplanetClient", return_value=object()):
-                        with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                        with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
                             with patch.object(controller, "charge_slot_allowed", return_value=False):
                                 with patch.object(controller, "apply_state") as apply_state:
                                     controller.run_once(args)
@@ -111,7 +116,7 @@ class RunOnceTests(unittest.TestCase):
         with patch.object(controller, "log_json", side_effect=lambda label, payload: events.append((label, payload))):
             with patch.object(controller, "env_or_default", return_value=""):
                 with patch.object(controller, "SolplanetClient", return_value=object()):
-                    with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                    with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
                         with patch.object(controller, "apply_state") as apply_state:
                             controller.run_once(args)
 
@@ -127,7 +132,7 @@ class RunOnceTests(unittest.TestCase):
 
         with patch.object(controller, "log_json", side_effect=lambda label, payload: events.append((label, payload))):
             with patch.object(controller, "SolplanetClient", return_value=object()):
-                with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
                     with patch.object(controller, "build_manual_price_horizon", return_value=prices):
                         with patch.object(controller, "apply_state") as apply_state:
                             controller.run_once(args)
@@ -149,7 +154,7 @@ class RunOnceTests(unittest.TestCase):
                     with patch.object(controller, "AmberClient") as amber_client_cls:
                         amber_client_cls.return_value.get_price_horizon.return_value = prices
                         with patch.object(controller, "SolplanetClient", return_value=object()):
-                            with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                            with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
                                 with patch.object(controller, "apply_state"):
                                     controller.run_once(args)
 
@@ -172,7 +177,7 @@ class RunOnceTests(unittest.TestCase):
                     with patch.object(controller, "AmberClient") as amber_client_cls:
                         amber_client_cls.return_value.get_price_horizon.return_value = prices
                         with patch.object(controller, "SolplanetClient", return_value=object()):
-                            with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                            with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
                                 with patch.object(controller, "apply_state") as apply_state:
                                     controller.run_once(args)
 
@@ -198,7 +203,7 @@ class RunOnceTests(unittest.TestCase):
                     with patch.object(controller, "AmberClient") as amber_client_cls:
                         amber_client_cls.return_value.get_price_horizon.return_value = prices
                         with patch.object(controller, "SolplanetClient", return_value=object()):
-                            with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                            with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
                                 with patch.object(controller, "apply_state") as apply_state:
                                     controller.run_once(args)
 
@@ -224,7 +229,7 @@ class RunOnceTests(unittest.TestCase):
                     with patch.object(controller, "AmberClient") as amber_client_cls:
                         amber_client_cls.return_value.get_price_horizon.return_value = prices
                         with patch.object(controller, "SolplanetClient", return_value=object()):
-                            with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                            with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
                                 with patch.object(controller, "apply_state") as apply_state:
                                     controller.run_once(args)
 
@@ -250,12 +255,80 @@ class RunOnceTests(unittest.TestCase):
                     with patch.object(controller, "AmberClient") as amber_client_cls:
                         amber_client_cls.return_value.get_price_horizon.return_value = prices
                         with patch.object(controller, "SolplanetClient", return_value=object()):
-                            with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                            with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
                                 with patch.object(controller, "apply_state") as apply_state:
                                     controller.run_once(args)
 
         self.assertFalse(events[1][1]["discharge_rule_matched"])
         self.assertEqual(events[1][1]["cheap_charge_minutes_in_lookahead"], 0)
+        self.assertEqual(events[1][1]["final_action"], "fallback")
+        self.assertEqual(apply_state.call_args.kwargs["action"], "fallback")
+
+    def test_run_once_uses_max_charge_watts_at_or_below_10_cents(self) -> None:
+        args = make_args("amber")
+        events: list[tuple[str, dict]] = []
+        now = dt("2026-03-25T10:30:00+11:00")
+        battery = BatterySnapshot(soc=70, battery_power_watts=0, battery_voltage_raw=5200, battery_current_raw=0)
+        prices = [price("2026-03-25T10:30:00+11:00", "2026-03-25T10:35:00+11:00", 9.5)]
+
+        with patch("solplanet_price_controller.datetime") as mock_dt:
+            mock_dt.now.return_value.astimezone.return_value = now
+            with patch.object(controller, "log_json", side_effect=lambda label, payload: events.append((label, payload))):
+                with patch.object(controller, "env_or_default", return_value="token"):
+                    with patch.object(controller, "AmberClient") as amber_client_cls:
+                        amber_client_cls.return_value.get_price_horizon.return_value = prices
+                        with patch.object(controller, "SolplanetClient", return_value=object()):
+                            with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
+                                with patch.object(controller, "apply_state") as apply_state:
+                                    controller.run_once(args)
+
+        self.assertEqual(events[1][1]["derived_action"], "charge")
+        self.assertEqual(events[1][1]["command_charge_watts"], 15000)
+        self.assertEqual(apply_state.call_args.kwargs["action"], "charge")
+        self.assertEqual(apply_state.call_args.kwargs["charge_watts"], 15000)
+
+    def test_run_once_uses_reduced_charge_watts_between_10_and_11_cents(self) -> None:
+        args = make_args("amber")
+        events: list[tuple[str, dict]] = []
+        now = dt("2026-03-25T12:30:00+11:00")
+        battery = BatterySnapshot(soc=70, battery_power_watts=0, battery_voltage_raw=5200, battery_current_raw=0)
+        prices = [price("2026-03-25T12:30:00+11:00", "2026-03-25T12:35:00+11:00", 10.5)]
+
+        with patch("solplanet_price_controller.datetime") as mock_dt:
+            mock_dt.now.return_value.astimezone.return_value = now
+            with patch.object(controller, "log_json", side_effect=lambda label, payload: events.append((label, payload))):
+                with patch.object(controller, "env_or_default", return_value="token"):
+                    with patch.object(controller, "AmberClient") as amber_client_cls:
+                        amber_client_cls.return_value.get_price_horizon.return_value = prices
+                        with patch.object(controller, "SolplanetClient", return_value=object()):
+                            with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
+                                with patch.object(controller, "apply_state") as apply_state:
+                                    controller.run_once(args)
+
+        self.assertEqual(events[1][1]["derived_action"], "charge")
+        self.assertEqual(events[1][1]["command_charge_watts"], 5000)
+        self.assertEqual(apply_state.call_args.kwargs["action"], "charge")
+        self.assertEqual(apply_state.call_args.kwargs["charge_watts"], 5000)
+
+    def test_run_once_does_not_charge_at_or_above_target_soc(self) -> None:
+        args = make_args("amber")
+        events: list[tuple[str, dict]] = []
+        now = dt("2026-03-25T10:30:00+11:00")
+        battery = BatterySnapshot(soc=97, battery_power_watts=0, battery_voltage_raw=5200, battery_current_raw=0)
+        prices = [price("2026-03-25T10:30:00+11:00", "2026-03-25T10:35:00+11:00", 5.0)]
+
+        with patch("solplanet_price_controller.datetime") as mock_dt:
+            mock_dt.now.return_value.astimezone.return_value = now
+            with patch.object(controller, "log_json", side_effect=lambda label, payload: events.append((label, payload))):
+                with patch.object(controller, "env_or_default", return_value="token"):
+                    with patch.object(controller, "AmberClient") as amber_client_cls:
+                        amber_client_cls.return_value.get_price_horizon.return_value = prices
+                        with patch.object(controller, "SolplanetClient", return_value=object()):
+                            with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
+                                with patch.object(controller, "apply_state") as apply_state:
+                                    controller.run_once(args)
+
+        self.assertEqual(events[1][1]["derived_action"], "fallback")
         self.assertEqual(events[1][1]["final_action"], "fallback")
         self.assertEqual(apply_state.call_args.kwargs["action"], "fallback")
 
@@ -273,7 +346,7 @@ class RunOnceTests(unittest.TestCase):
                     with patch.object(controller, "AmberClient") as amber_client_cls:
                         amber_client_cls.return_value.get_price_horizon.return_value = prices
                         with patch.object(controller, "SolplanetClient", return_value=object()):
-                            with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                            with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
                                 with patch.object(controller, "apply_state") as apply_state:
                                     controller.run_once(args)
 
@@ -295,7 +368,7 @@ class RunOnceTests(unittest.TestCase):
                     with patch.object(controller, "AmberClient") as amber_client_cls:
                         amber_client_cls.return_value.get_price_horizon.return_value = prices
                         with patch.object(controller, "SolplanetClient", return_value=object()):
-                            with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                            with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
                                 with patch.object(controller, "apply_state") as apply_state:
                                     controller.run_once(args)
 
@@ -303,7 +376,7 @@ class RunOnceTests(unittest.TestCase):
         self.assertEqual(events[1][1]["final_action"], "charge")
         self.assertEqual(apply_state.call_args.kwargs["action"], "charge")
 
-    def test_run_once_does_not_charge_at_11_cents_before_1pm(self) -> None:
+    def test_run_once_uses_reduced_charge_watts_at_11_cents_before_1pm(self) -> None:
         args = make_args("amber")
         events: list[tuple[str, dict]] = []
         now = dt("2026-03-25T12:30:00+11:00")
@@ -317,13 +390,14 @@ class RunOnceTests(unittest.TestCase):
                     with patch.object(controller, "AmberClient") as amber_client_cls:
                         amber_client_cls.return_value.get_price_horizon.return_value = prices
                         with patch.object(controller, "SolplanetClient", return_value=object()):
-                            with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                            with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
                                 with patch.object(controller, "apply_state") as apply_state:
                                     controller.run_once(args)
 
-        self.assertEqual(events[1][1]["derived_action"], "fallback")
-        self.assertEqual(events[1][1]["final_action"], "fallback")
-        self.assertEqual(apply_state.call_args.kwargs["action"], "fallback")
+        self.assertEqual(events[1][1]["derived_action"], "charge")
+        self.assertEqual(events[1][1]["command_charge_watts"], 5000)
+        self.assertEqual(apply_state.call_args.kwargs["action"], "charge")
+        self.assertEqual(apply_state.call_args.kwargs["charge_watts"], 5000)
 
     def test_run_once_never_charges_during_demand_window(self) -> None:
         args = make_args("amber")
@@ -339,7 +413,7 @@ class RunOnceTests(unittest.TestCase):
                     with patch.object(controller, "AmberClient") as amber_client_cls:
                         amber_client_cls.return_value.get_price_horizon.return_value = prices
                         with patch.object(controller, "SolplanetClient", return_value=object()):
-                            with patch.object(controller, "load_battery_snapshot", return_value=battery):
+                            with patch.object(controller, "load_battery_snapshot_with_telemetry", return_value=(battery, {})):
                                 with patch.object(controller, "apply_state") as apply_state:
                                     controller.run_once(args)
 

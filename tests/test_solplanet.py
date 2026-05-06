@@ -13,6 +13,7 @@ from solplanet import (
     current_slot,
     desired_state,
     load_battery_snapshot,
+    load_battery_snapshot_with_telemetry,
 )
 
 
@@ -97,6 +98,18 @@ class SolplanetBoundaryTests(unittest.TestCase):
             battery,
             BatterySnapshot(soc=39, battery_power_watts=785, battery_voltage_raw=5200, battery_current_raw=151),
         )
+        self.assertEqual(client.get_calls, ["getdevdata.cgi?device=4&sn=BATTERY123"])
+
+    def test_load_battery_snapshot_with_telemetry_returns_raw_payload(self) -> None:
+        client = FakeSolplanetClient()
+
+        battery, telemetry = load_battery_snapshot_with_telemetry(client, "BATTERY123")
+
+        self.assertEqual(
+            battery,
+            BatterySnapshot(soc=39, battery_power_watts=785, battery_voltage_raw=5200, battery_current_raw=151),
+        )
+        self.assertEqual(telemetry, load_fixture("solplanet_getdevdata.json"))
         self.assertEqual(client.get_calls, ["getdevdata.cgi?device=4&sn=BATTERY123"])
 
     def test_apply_state_writes_expected_payloads_and_logs_confirmation(self) -> None:
